@@ -4,6 +4,17 @@ All notable changes to cock-cage. Versions follow semantic versioning. Tags are 
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-23
+
+### Fixed (second independent review)
+- Requests are approved only by a reply containing their id ("yes 3f2a"), shown to the user in a status line. A stray "ok" never approves a deletion or a loosening, only one request can be open at a time, and an expired request no longer swallows plan approval.
+- Obvious self-approval routes are blocked: calling hooks by hand, hiding `CLAUDECODE`, faking a terminal, and scripts or heredocs that touch the ledger, config, state or approval records. The CLI also treats any call without a real terminal as Claude. This is a speed bump, not a security boundary, and the docs now say so.
+- `2>&1`, `>&2` and heredoc bodies are no longer mistaken for file writes or commands; `bash -lc`, `eval`, unfiltered `find -delete` and force checkouts are caught.
+- Setup is never triggered by negated or questioning mentions ("don't install cock-cage"), an ignored offer counts as a no, and init refuses unless the user's agreement was recorded.
+- A fresh repository's first commit unstages secrets and vendored files that were staged before init, and only treats top-level build or virtualenv folders as vendored (`src/env/` is your code).
+- On Python 3.9/3.10, init validates TOML with the project's newer interpreter or uv, and otherwise leaves dotted tool keys alone.
+- Files changed by shell commands during a task (for example `uv add` updating `pyproject.toml` and `uv.lock`) are committed with the task.
+
 ## [0.2.0] - 2026-10-22
 
 ### Added

@@ -79,6 +79,7 @@ print("python for hooks:", sh([PY, "--version"], work).stdout.strip(), "| workdi
 print("\n[1] empty project")
 empty = os.path.join(work, "empty")
 os.makedirs(empty)
+hook(empty, "user-prompt", {"prompt": "set up cock-cage here"})   # the user's agreement, as the hook records it
 out = sh([PY, CC, "init"], empty)
 print(textwrap.indent(out.stdout.strip(), "    "))
 expect(os.path.isdir(os.path.join(empty, ".git")), "git repository created")
@@ -151,6 +152,7 @@ with open(os.path.join(ex, "pricing", "core.py"), "a") as fh:
     fh.write("\n# work in progress by the user\n")
 open(os.path.join(ex, "notes.txt"), "w").write("my scratch notes\n")
 
+hook(ex, "user-prompt", {"prompt": "set up cock-cage here"})
 out = sh([PY, CC, "init"], ex)
 print(textwrap.indent(out.stdout.strip(), "    "))
 expect("work in progress" in open(os.path.join(ex, "pricing", "core.py")).read(), "user's uncommitted edit untouched")

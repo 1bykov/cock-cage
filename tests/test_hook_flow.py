@@ -61,6 +61,7 @@ def wait_baseline(root, limit=60):
 def setup(root):
     import subprocess, sys
     from conftest import CC
+    hook(str(root), "user-prompt", {"prompt": "set up cock-cage here"})
     r = subprocess.run([sys.executable, CC, "init", "--no-tools", "--no-baseline"], cwd=root, capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
 

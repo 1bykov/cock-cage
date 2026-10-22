@@ -63,6 +63,10 @@ def dirty_paths(root: str) -> List[str]:
     return sorted(porcelain(root)) if is_repo(root) else []
 
 
+def is_tracked(root: str, path: str) -> bool:
+    return git(root, "ls-files", "--error-unmatch", "--", path)[0] == 0
+
+
 def committable(root: str, paths: Sequence[str]) -> List[str]:
     """Keep paths git can stage: inside the repo, not ignored, and existing or tracked (deleted files count)."""
     if not paths or not is_repo(root):

@@ -64,8 +64,18 @@ def is_negative(prompt: str) -> bool:
     return bool(NEGATIVE_RE.match(prompt or ""))
 
 
+SETUP_NEG_RE = re.compile(r"\b(no|not|don't|do not|never|without|stop|remove|uninstall|disable|what|why|how|whether)\b|\?", re.I)
+
+
 def asks_for_setup(prompt: str) -> bool:
-    return bool(CC_MENTION_RE.search(prompt or "") and SETUP_RE.search(prompt or ""))
+    """An explicit, unnegated instruction to set cock-cage up ("set up cock-cage here")."""
+    p = (prompt or "").strip()
+    if p.lower().startswith("/cock-cage:init"):
+        return True
+    for sentence in re.split(r"(?<=[.!?])\s+|\n+", p):
+        if CC_MENTION_RE.search(sentence) and SETUP_RE.search(sentence) and not SETUP_NEG_RE.search(sentence):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------- folder offers
@@ -122,16 +132,44 @@ def describe(req: Dict[str, Any]) -> str:
     return ACTIONS.get(req.get("action", ""), req.get("action", "?")).format(**args)
 
 
+def pending(st: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The open request, dropping it first if it has expired."""
+    req = st.get("request")
+    if not req:
+        return None
+    if time.time() - float(req.get("created", 0)) > REQUEST_TTL_SECONDS and not req.get("approved_at"):
+        st["request"] = None
+        return None
+    return req
+
+
 def create(st: Dict[str, Any], action: str, args: Dict[str, Any], reason: str) -> Dict[str, Any]:
-    req = {"id": secrets.token_hex(3), "action": action, "args": args, "reason": reason.strip(),
+    cur = pending(st)
+    if cur and not cur.get("approved_at"):
+        raise ValueError("request %s (%s) is still waiting for the user; resolve it first" % (cur["id"], describe(cur)))
+    req = {"id": secrets.token_hex(2), "action": action, "args": args, "reason": reason.strip(),
            "created": time.time(), "approved_at": None}
     st["request"] = req
     return req
 
 
+def answers_request(prompt: str, req_id: str, words: List[str]) -> Optional[bool]:
+    """True/False if the message approves/declines this request by its id, None if it is about something else.
+
+    The id must appear in the user's reply ("yes 3f2a", "no 3f2a"), so a stray "ok" can never approve
+    a deletion or a loosening, and approving one request can never approve another.
+    """
+    if not re.search(r"\b%s\b" % re.escape(req_id), prompt or "", re.I):
+        return None
+    rest = re.sub(r"\b%s\b" % re.escape(req_id), " ", prompt, flags=re.I)
+    if is_negative(rest):
+        return False
+    return True if is_affirmative(rest, words) else None
+
+
 def approve_pending(st: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    req = st.get("request")
-    if req and not req.get("approved_at") and time.time() - float(req.get("created", 0)) < REQUEST_TTL_SECONDS:
+    req = pending(st)
+    if req and not req.get("approved_at"):
         req["approved_at"] = time.time()
         return req
     return None
@@ -150,5 +188,15 @@ def consume(st: Dict[str, Any], req_id: str) -> Dict[str, Any]:
 
 
 def claude_is_calling() -> bool:
-    """True when the CLI runs inside a Claude Code session rather than the user's own terminal."""
-    return bool(os.environ.get("CLAUDECODE") or os.environ.get("CLAUDE_CODE_ENTRYPOINT"))
+    """True unless the CLI runs in the user's own interactive terminal.
+
+    Claude Code sets CLAUDECODE, and its Bash tool has no terminal attached. Either signal is enough.
+    This is a speed bump, not a security boundary: an agent with the user's rights can always find a way.
+    """
+    import sys
+    if os.environ.get("CLAUDECODE") or os.environ.get("CLAUDE_CODE_ENTRYPOINT"):
+        return True
+    try:
+        return not (sys.stdin.isatty() and sys.stdout.isatty())
+    except (AttributeError, ValueError):
+        return True

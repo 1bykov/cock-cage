@@ -35,7 +35,7 @@ Approving plans, and two things that protect the integrity of the cage:
 - **Deleting ledger reports.** Ask Claude to remove a report and it files a request and asks you to confirm.
 - **Loosening a check.** For example, turning test failures from blocking into warnings.
 
-Your reply is read by a hook, which records the approval. Claude cannot record it itself, and the command that carries the action out refuses without it.
+Each request has a short id, shown in a status line. Reply "yes 3f2a" to allow it or "no 3f2a" to refuse. A plain "ok" never counts, so a passing remark can't approve a deletion. Your reply is read by a hook, Claude has no command that records approval, and the obvious workarounds are blocked. Treat this as a strong speed bump rather than a security boundary, because an agent running with your user rights could in principle get around anything enforced on the same machine.
 
 Everything else Claude does on its own: setting up projects, adding dependencies (noted in the report), merging, releasing project versions, and growing and publishing the skills library.
 
@@ -80,7 +80,7 @@ Say "save this as a skill" after a task you liked, or run `/cock-cage:capture-sk
 ## Limits worth knowing
 
 - Hooks fail open. If cock-cage itself crashes, the error goes to `.cock-cage/hook-errors.log` and Claude carries on, so a bug never bricks a session.
-- Shell commands are checked by pattern. A determined agent could still write a script that edits a protected file. The hash chain makes that visible even when prevention fails.
+- Shell commands are checked by pattern. A determined agent could still write a script that edits a protected file or fakes an approval. The hash chain and the seal copy in `~/.cock-cage` make ledger tampering visible, but none of this is cryptographic proof against an agent with your user rights.
 - Duplicate detection catches copy-paste and renamed copies. The same idea written in a different shape needs the reviewer subagent.
 - If Claude edits within seconds of a session starting, before the baseline finishes, test failures downgrade to warnings and the report says so.
 - On macOS the ledger's append-only flag also stops Finder, `rm -rf` and `git clean -fdx` from deleting it. Ask Claude to unlock it first; it will ask you to confirm.

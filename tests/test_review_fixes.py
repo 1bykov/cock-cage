@@ -11,6 +11,7 @@ from cockcage import approvals, config, gitops, guards, initproj, ledger
 
 
 def setup(root):
+    hook(str(root), "user-prompt", {"prompt": "set up cock-cage here"})
     r = subprocess.run([sys.executable, CC, "init", "--no-tools", "--no-baseline"], cwd=str(root), capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
 

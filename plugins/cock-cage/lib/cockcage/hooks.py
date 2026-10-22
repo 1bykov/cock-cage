@@ -140,12 +140,12 @@ def _start_task(root: str, st: Dict[str, Any], phase: str, title: str) -> None:
 def _folder_reply(root: str, prompt: str) -> Optional[Dict[str, Any]]:
     status = approvals.folder_status(root)
     words = list(config.DEFAULTS["approve_words"]) + ["sure", "ok", "okay", "please do", "set it up"]
-    pending = status in ("offered", "asked")
-    if approvals.asks_for_setup(prompt) or (pending and approvals.is_affirmative(prompt, words)):
+    if approvals.asks_for_setup(prompt) or (status == "asked" and approvals.is_affirmative(prompt, words)):
         approvals.set_folder_status(root, "approved")
         return _ctx_out("UserPromptSubmit", "cock-cage: the user agreed to set it up. Run `python3 \"%s\" init` "
                         "from the project root now, summarise the result, then continue with their request." % SCRIPT)
-    if pending and approvals.is_negative(prompt):
+    if status == "asked":
+        # Asked once: any other reply (a no, or simply carrying on) settles it for good.
         approvals.set_folder_status(root, "declined")
     return None
 
@@ -161,13 +161,14 @@ def user_prompt(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     plan_exists = os.path.exists(util.cc_path(root, "plan.md"))
     with state.locked(root) as st:
         phase = st["task"]["phase"]
-        req = st.get("request")
+        req = approvals.pending(st)
         if req and not req.get("approved_at"):
-            if approvals.is_affirmative(prompt, words):
+            answer = approvals.answers_request(prompt, req["id"], words)
+            if answer is True:
                 approvals.approve_pending(st)
                 return _ctx_out("UserPromptSubmit", "cock-cage: the user approved request %s (%s). Run "
                                 "`.cock-cage/bin/cockcage apply %s` now." % (req["id"], approvals.describe(req), req["id"]))
-            if approvals.is_negative(prompt):
+            if answer is False:
                 st["request"] = None
                 return _ctx_out("UserPromptSubmit", "cock-cage: the user declined request %s. Drop it." % req["id"])
         if prompt.strip().lower().startswith(quick):
@@ -218,6 +219,9 @@ def pre_tool(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     findings = guards.pre_tool_findings(tool, tin, ctx)
     if tool in guards.EDIT_TOOLS and ctx.phase in ("approved", "quick") and not findings:
         _remember_format_state(root, tin, st)
+    if tool == "Bash" and ctx.phase in ("approved", "quick") and gitops.is_repo(root):
+        with state.locked(root) as s2:  # snapshot, so files this command changes can be attributed to the task
+            s2["task"]["bash_pre"] = gitops.dirty_paths(root)
     if not findings:
         return None
     levels = {f.check: config.level(cfg, f.check) for f in findings}
@@ -295,6 +299,9 @@ def post_tool(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             with state.locked(root) as st:
                 st["task"]["reviewed"] = True
         return None
+    if tool == "Bash":
+        _track_bash_changes(root)
+        return None
     if tool not in guards.EDIT_TOOLS:
         return None
     p = tin.get("file_path") or tin.get("notebook_path") or ""
@@ -337,6 +344,25 @@ def post_tool(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if msgs:
         return _ctx_out("PostToolUse", "cock-cage feedback (fix now or before finishing):\n" + "\n\n".join(msgs))
     return None
+
+
+def _track_bash_changes(root: str) -> None:
+    """Files a shell command changed (e.g. uv add touching pyproject.toml and uv.lock) join the task."""
+    st = state.load(root)
+    task = st["task"]
+    if task.get("phase") not in ("approved", "quick") or "bash_pre" not in task or not gitops.is_repo(root):
+        return
+    before = set(task.get("bash_pre") or [])
+    after = set(gitops.dirty_paths(root))
+    skip = set(task.get("dirty_at_start", []))
+    new = sorted(p for p in after - before - skip if not p.startswith(util.CC_DIR + "/") and p != util.CC_DIR)
+    with state.locked(root) as s2:
+        for p in new:
+            if p not in s2["task"]["touched"]:
+                s2["task"]["touched"].append(p)
+            if p not in s2["task"].get("created", []) and not gitops.is_tracked(root, p):
+                s2["task"].setdefault("created", []).append(p)
+        s2["task"].pop("bash_pre", None)
 
 
 def _log_skill(root: str, tin: Dict[str, Any], payload: Dict[str, Any]) -> None:
@@ -389,6 +415,10 @@ def stop(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     cfg = config.load(root)
     st = state.load(root)
     task = st["task"]
+    req = st.get("request")
+    if req and not req.get("approved_at"):
+        return {"systemMessage": "cock-cage: Claude is asking to %s (reason: %s). Reply \"yes %s\" to allow it or "
+                                 "\"no %s\" to refuse." % (approvals.describe(req), req.get("reason", ""), req["id"], req["id"])}
     touched = [t for t in task.get("touched", [])]
     draft_text = util.read_text(report.draft_path(root))
     if not touched and not draft_text:

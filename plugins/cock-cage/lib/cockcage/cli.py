@@ -69,7 +69,7 @@ def cmd_baseline(args: argparse.Namespace) -> int:
 def cmd_init(args: argparse.Namespace) -> int:
     root = _root(args)
     status = approvals.folder_status(root)
-    if approvals.claude_is_calling() and not os.path.isdir(util.cc_path(root)) and status in ("offered", "asked", "declined"):
+    if approvals.claude_is_calling() and not os.path.isdir(util.cc_path(root)) and status not in ("approved", "set-up"):
         print("Not set up: the user has not agreed to cock-cage in this folder. Ask them first.")
         return 3
     print("cock-cage %s: setting up %s" % (plugin_version(), root))
@@ -306,11 +306,16 @@ def cmd_request(args: argparse.Namespace) -> int:
     if not args.reason.strip():
         print("Give a --reason the user can judge.")
         return 2
-    with state.locked(root) as st:
-        req = approvals.create(st, args.action, payload, args.reason)
+    try:
+        with state.locked(root) as st:
+            req = approvals.create(st, args.action, payload, args.reason)
+    except ValueError as exc:
+        print("Not filed: %s." % exc)
+        return 2
     print("Request %s filed: %s. Reason: %s" % (req["id"], approvals.describe(req), req["reason"]))
-    print("Now ask the user in plain words whether to %s, and wait for their reply. "
-          "If they agree, run: cockcage apply %s" % (approvals.describe(req), req["id"]))
+    print("Now ask the user in plain words whether to %s, and tell them to reply \"yes %s\" or \"no %s\". "
+          "Only a reply containing %s counts. When the hook confirms approval, run: cockcage apply %s"
+          % (approvals.describe(req), req["id"], req["id"], req["id"], req["id"]))
     return 0
 
 

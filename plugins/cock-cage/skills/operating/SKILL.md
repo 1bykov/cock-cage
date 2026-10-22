@@ -35,7 +35,7 @@ cockcage request ledger-reseal --reason "the user edited the ledger by hand"
 cockcage request loosen tests warn --reason "integration tests need a database we don't have here"
 ```
 
-Then ask in one plain sentence, e.g. "Shall I delete reports #3 and #5? They are duplicates from the crashed session." Only the hook can record their answer. When it tells you the request is approved, run `cockcage apply <id>`. If they say no, drop it. Never try another route to the same effect.
+Then ask in one plain sentence and give them the id, e.g. "Shall I delete reports #3 and #5? They are duplicates from the crashed session. Reply 'yes 3f2a' to allow it." Only a reply containing the id counts, and only the hook records it. When it tells you the request is approved, run `cockcage apply <id>`. If they say no, drop it. One request can be open at a time. Never try another route to the same effect: no calling hooks by hand, no editing state or config, no hiding that you are running a command.
 
 ## Reading the ledger
 

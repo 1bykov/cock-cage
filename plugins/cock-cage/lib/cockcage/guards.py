@@ -99,6 +99,11 @@ def is_protected(ctx: Context, ap: str) -> Optional[str]:
     claude_dir = os.path.join(ctx.root, ".claude")
     if util.is_inside(claude_dir, ap) and os.path.basename(ap).startswith("settings"):
         return "project Claude settings control the cage itself"
+    udir = util.user_dir()
+    if util.is_inside(udir, ap):
+        relu = os.path.relpath(os.path.realpath(ap), os.path.realpath(udir)).replace(os.sep, "/")
+        if relu in ("folders.json", "settings.json") or relu.startswith("ledgers"):
+            return "cock-cage's approval records live there"
     home_claude = os.path.expanduser("~/.claude")
     if util.is_inside(home_claude, ap):
         relh = os.path.relpath(os.path.realpath(ap), os.path.realpath(home_claude)).replace(os.sep, "/")
@@ -165,8 +170,9 @@ def _strip_wrappers(toks: List[str]) -> List[str]:
 def parse_commands(cmd: str, depth: int = 0) -> List[Tuple[List[str], List[str]]]:
     """Split a shell command line into simple commands: (argv, redirect targets).
 
-    Quote-aware, so '>' or '|' inside quotes is data, not an operator. `bash -c "..."` is
-    parsed recursively so wrapping a command in a shell does not hide it.
+    Quote-aware, so '>' or '|' inside quotes is data, not an operator. Heredoc bodies are data
+    too. `bash -c "..."`, `bash -lc '...'` and `eval '...'` are parsed recursively so wrapping a
+    command does not hide it.
     """
     try:
         toks = _tokens(cmd or "")
@@ -175,6 +181,7 @@ def parse_commands(cmd: str, depth: int = 0) -> List[Tuple[List[str], List[str]]
     out: List[Tuple[List[str], List[str]]] = []
     argv_: List[str] = []
     redirs: List[str] = []
+    heredocs: List[str] = []
     i = 0
     while i <= len(toks):
         t = toks[i] if i < len(toks) else ";"
@@ -182,22 +189,54 @@ def parse_commands(cmd: str, depth: int = 0) -> List[Tuple[List[str], List[str]]
             if argv_ or redirs:
                 a = _strip_wrappers(argv_)
                 out.append((a, redirs))
-                if depth < 2 and a and os.path.basename(a[0]) in SHELLS and "-c" in a:
-                    k = a.index("-c")
-                    if k + 1 < len(a):
-                        out.extend(parse_commands(a[k + 1], depth + 1))
+                if depth < 3 and a:
+                    prog = os.path.basename(a[0])
+                    inner = None
+                    if prog in SHELLS:
+                        for k, arg in enumerate(a[1:], 1):
+                            if re.fullmatch(r"-[a-zA-Z]*c[a-zA-Z]*", arg) and k + 1 < len(a):
+                                inner = a[k + 1]
+                                break
+                    elif prog == "eval" and len(a) > 1:
+                        inner = " ".join(a[1:])
+                    if inner:
+                        out.extend(parse_commands(inner, depth + 1))
             argv_, redirs = [], []
+            if "\n" in t and heredocs:
+                delim = heredocs.pop(0)
+                i = _skip_body(toks, i, delim)
+                heredocs = []
+                continue
+        elif t in ("<<", "<<-"):
+            if i + 1 < len(toks):
+                heredocs.append(toks[i + 1])
+            i += 1
+        elif t == "<<<":
+            i += 1  # here-string: the next token is data
         elif t in REDIRECT_OPS or re.fullmatch(r"[<>&]+", t):
             if argv_ and argv_[-1].isdigit():
                 argv_.pop()  # an fd number like the 2 in 2>file
             target = toks[i + 1] if i + 1 < len(toks) else ""
-            if ">" in t and target and target not in ("/dev/null", "&1", "&2") and not target.startswith("&"):
+            fd_dup = t.endswith("&") and (target.isdigit() or target == "-")
+            if ">" in t and target and not fd_dup and target not in ("/dev/null", "&1", "&2") and not target.startswith("&"):
                 redirs.append(target)
             i += 1  # skip the target (also for < input redirection)
         else:
             argv_.append(t)
         i += 1
     return out
+
+
+def _skip_body(toks: List[str], i: int, delim: str) -> int:
+    """toks[i] is the newline ending the heredoc's command line; return the index after the body."""
+    j = i + 1
+    line_start = True
+    while j < len(toks):
+        if line_start and toks[j] == delim and (j + 1 >= len(toks) or toks[j + 1].startswith("\n")):
+            return j + 1
+        line_start = toks[j].endswith("\n")
+        j += 1
+    return len(toks)
 
 
 def argv(segment: str) -> List[str]:
@@ -309,6 +348,8 @@ def _git_findings(toks: List[str], ctx: Context) -> List[Finding]:
     elif sub in ("checkout", "restore") and rest and rest[-1] in (".", "--", ":/") and not (
             sub == "restore" and "--staged" in rest and "--worktree" not in rest and "-w" not in rest):
         out.append(Finding("dangerous", "Discarding all working-tree changes is irreversible."))
+    elif sub in ("switch", "checkout") and any(t in ("-f", "--force", "--discard-changes") for t in rest):
+        out.append(Finding("dangerous", "Force-switching discards local changes."))
     elif sub == "stash" and rest[:1] in (["drop"], ["clear"]):
         out.append(Finding("dangerous", "Dropping stashes loses work."))
     elif sub == "branch" and any(t in ("-d", "-D", "--delete") for t in rest) and any(b in rest for b in prot):
@@ -325,10 +366,32 @@ def _git_findings(toks: List[str], ctx: Context) -> List[Finding]:
     return out
 
 
+TAMPER_PATTERNS = (
+    (re.compile(r"(cc\.py|cockcage)\b[^\n]*\bhook\b"), "cock-cage hooks are run by Claude Code itself, never by hand."),
+    (re.compile(r"\benv\b[^\n]*\s-u\s*CLAUDE|\bunset\s+CLAUDE|(^|[\s;&|])CLAUDE(CODE|_CODE_ENTRYPOINT)="),
+     "Hiding that Claude is running a command is not allowed."),
+    (re.compile(r"\bscript\b[^\n]*(cc\.py|cockcage)"), "Faking a terminal for cock-cage is not allowed."),
+)
+PROTECTED_TEXT = re.compile(
+    r"\.cock-cage/(reports\.md|ledger\.seal|config\.json|state\.json)|\.cock-cage/(folders\.json|ledgers)\b|"
+    r"(^|[\s'\"/])(ledger\.seal|folders\.json)\b")
+
+
 def bash_findings(cmd: str, ctx: Context) -> List[Finding]:
     out: List[Finding] = []
     if USER_ONLY_CLI.search(cmd or ""):
         out.append(Finding("ledger_protection", "That cock-cage command is reserved for the user's own terminal."))
+    for pat, msg in TAMPER_PATTERNS:
+        if pat.search(cmd or ""):
+            out.append(Finding("ledger_protection", msg))
+    if PROTECTED_TEXT.search(cmd or ""):
+        cmds = parse_commands(cmd)
+        readonly_only = all(
+            (_prog(t) in READONLY_PROGRAMS or (_prog(t) == "git" and len(t) > 1 and t[1] in ("log", "show", "diff", "status")))
+            and not r for t, r in cmds) and "<<" not in cmd
+        if not readonly_only:
+            out.append(Finding("ledger_protection", "Commands that touch cock-cage's ledger, config, state or approval "
+                                                    "records are blocked; use the cockcage CLI."))
     for toks, redirs in parse_commands(cmd):
         prog = _prog(toks)
         raw = " ".join(toks)
@@ -341,6 +404,8 @@ def bash_findings(cmd: str, ctx: Context) -> List[Finding]:
             out.append(Finding("dangerous", "Disk-level commands are blocked."))
         if prog == "chmod" and re.search(r"-R\b.*\b777\b|\b777\b.*-R\b", raw):
             out.append(Finding("dangerous", "chmod -R 777 is never the fix."))
+        if prog == "find" and "-delete" in toks and not any(t in toks for t in ("-name", "-iname", "-path", "-regex", "-newer")):
+            out.append(Finding("dangerous", "find -delete without a name or path filter deletes everything it walks."))
         if prog in ("chflags", "chattr", "xattr"):
             out.append(Finding("ledger_protection", "File flag changes are reserved for the user."))
         if prog == "git":

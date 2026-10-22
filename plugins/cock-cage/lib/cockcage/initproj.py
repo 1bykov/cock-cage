@@ -21,7 +21,16 @@ ROOT_GITIGNORE_LINES = [
     "!.env.example", ".DS_Store", "node_modules/", "*.pem", "*.key", "*.p12",
 ]
 
-VENDORED_DIRS = ("node_modules/", ".venv/", "venv/", "env/", "build/", "dist/", "__pycache__/", ".tox/", "site-packages/")
+TOP_VENDORED = {"node_modules", ".venv", "venv", ".tox", "build", "dist", ".eggs"}
+ANY_VENDORED = {"node_modules", "__pycache__", "site-packages"}
+
+
+def _is_vendored(root: str, relp: str) -> bool:
+    parts = relp.replace(os.sep, "/").split("/")
+    if parts[0] in TOP_VENDORED or any(p in ANY_VENDORED for p in parts[:-1]):
+        return True
+    # a top-level virtualenv under another name (env/, .env-py/): recognised by its pyvenv.cfg
+    return len(parts) > 1 and os.path.exists(os.path.join(root, parts[0], "pyvenv.cfg"))
 
 CLAUDE_MD_START = "<!-- cock-cage:start -->"
 CLAUDE_MD_END = "<!-- cock-cage:end -->"
@@ -87,16 +96,42 @@ def _ensure_root_gitignore(root: str) -> bool:
     return True
 
 
-def _toml_ok(text: str) -> bool:
+_TOML_CHECK = "import sys, tomllib; tomllib.loads(sys.stdin.read())"
+
+
+def _toml_ok(text: str, root: str = "") -> Optional[bool]:
+    """True/False if the TOML was checked, None if no parser was available (Python 3.9/3.10, no venv)."""
     try:
         import tomllib  # type: ignore  # Python 3.11+
+        try:
+            tomllib.loads(text)
+            return True
+        except Exception:
+            return False
     except ImportError:
-        return True  # cannot check on 3.9/3.10; the header family check below prevents the known clash
+        pass
+    for py in [util.project_python(root)] if root else []:
+        code, _, err = _run_with_input([py, "-c", _TOML_CHECK], text, root)
+        if code == 0:
+            return True
+        if "ModuleNotFoundError" not in err and "ImportError" not in err:
+            return False
+    if shutil.which("uv"):
+        code, _, err = _run_with_input(["uv", "run", "--no-project", "--quiet", "--python", ">=3.11", "python", "-c", _TOML_CHECK], text, root or ".")
+        if code == 0:
+            return True
+        if "TOMLDecodeError" in err:
+            return False
+    return None
+
+
+def _run_with_input(cmd: List[str], text: str, cwd: str) -> Tuple[int, str, str]:
+    import subprocess
     try:
-        tomllib.loads(text)
-        return True
-    except Exception:
-        return False
+        p = subprocess.run(cmd, input=text, capture_output=True, text=True, cwd=cwd or None, timeout=120)
+        return p.returncode, p.stdout, p.stderr
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 127, "", str(exc)
 
 
 def _requires_python(text: str) -> Optional[str]:
@@ -107,7 +142,8 @@ def _requires_python(text: str) -> Optional[str]:
 def _ensure_tool_tables(root: str, type_checker: str) -> List[str]:
     p = os.path.join(root, "pyproject.toml")
     original = util.read_text(p)
-    if original and not _toml_ok(original):
+    checked = _toml_ok(original, root) if original else True
+    if checked is False:
         return []  # never touch a pyproject that is already unparseable
     text = original
     added = []
@@ -122,6 +158,9 @@ def _ensure_tool_tables(root: str, type_checker: str) -> List[str]:
         family = table.split(".")[0] + r"\." + table.split(".")[1]  # tool.ruff -> any [tool.ruff...] table
         if re.search(r"^\[\[?\s*%s[.\]\s]" % family, text, re.M):
             continue
+        name = table.split(".")[1]
+        if checked is None and re.search(r"(^|\n)\s*(tool\.)?%s\s*[.=]" % re.escape(name), text):
+            continue  # dotted keys such as `ruff.line-length = 120` under [tool]: cannot merge safely without a parser
         if table == "tool.ruff":
             block = block.format(target='' if _requires_python(text) else 'target-version = "py39"\n')
         if text and not text.endswith("\n"):
@@ -129,7 +168,7 @@ def _ensure_tool_tables(root: str, type_checker: str) -> List[str]:
         text += ("\n" if text else "") + block
         added.append(table)
     if added:
-        if not _toml_ok(text):
+        if _toml_ok(text, root) is False:
             return []
         util.write_text(p, text)
     return added
@@ -259,11 +298,14 @@ def init(root: str, pm: str = "auto", tools: bool = True, commit: bool = True,
             from .guards import is_secret_path
             candidates = sorted(_porcelain(root))
             skipped_secret = [f for f in candidates if is_secret_path(f)]
-            skipped_vendor = [f for f in candidates if any(("/" + f).find("/" + v) >= 0 for v in VENDORED_DIRS)]
+            skipped_vendor = [f for f in candidates if _is_vendored(root, f)]
             big = [f for f in candidates if os.path.isfile(os.path.join(root, f))
                    and os.path.getsize(os.path.join(root, f)) > large_file_mb * 1024 * 1024]
             leave = set(skipped_secret) | set(skipped_vendor) | set(big)
             to_add = [f for f in candidates if f not in leave]
+            leave_list = sorted(leave)
+            for i in range(0, len(leave_list), 200):  # unstage anything staged before init ran
+                gitops.git(root, "rm", "-r", "--cached", "--quiet", "--ignore-unmatch", "--", *leave_list[i:i + 200])
             for i in range(0, len(to_add), 200):
                 gitops.git(root, "add", "--", *to_add[i:i + 200])
             if skipped_secret:

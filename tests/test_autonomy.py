@@ -26,6 +26,8 @@ def test_offer_once_then_setup_on_yes(repo):
     assert "not set up in this folder" in ctx and "cc.py" in ctx
     assert not os.path.isdir(os.path.join(root, ".cock-cage")), "offering must not create files"
     assert hook(root, "session-start", {"source": "startup"}) is None, "ask once only"
+    hook(root, "user-prompt", {"prompt": "what does app.py do"})   # the user's first message is their task
+    hook(root, "stop", {"last_assistant_message": "It adds. Shall I set up cock-cage here?"})
     out = hook(root, "user-prompt", {"prompt": "yes please"})
     assert "agreed" in out["hookSpecificOutput"]["additionalContext"]
     assert approvals.folder_status(root) == "approved"
@@ -38,6 +40,7 @@ def test_offer_once_then_setup_on_yes(repo):
 def test_declined_folder_is_left_alone(repo):
     root = str(repo)
     hook(root, "session-start", {"source": "startup"})
+    hook(root, "stop", {"last_assistant_message": "Shall I set up cock-cage here?"})
     hook(root, "user-prompt", {"prompt": "no thanks"})
     assert approvals.folder_status(root) == "declined"
     r = cli(root, "init", "--no-tools", "--no-baseline")
@@ -57,6 +60,7 @@ def test_no_offer_in_non_projects(tmp_path):
 
 
 def _setup(root):
+    hook(str(root), "user-prompt", {"prompt": "set up cock-cage here"})
     assert cli(root, "init", "--no-tools", "--no-baseline").returncode == 0
 
 
@@ -71,7 +75,11 @@ def test_ledger_delete_needs_chat_approval(repo):
     req_id = r.stdout.split()[1]
     r = cli(root, "apply", req_id)
     assert r.returncode == 3 and "not been approved" in r.stdout
-    out = hook(root, "user-prompt", {"prompt": "yes"})
+    assert hook(root, "user-prompt", {"prompt": "yes"}) is None or "approved request" not in str(
+        hook(root, "user-prompt", {"prompt": "ok"})), "a bare yes never approves a request"
+    out = hook(root, "stop", {"last_assistant_message": "Shall I?"})
+    assert 'yes %s' % req_id in out["systemMessage"], "the pending request is shown to the user"
+    out = hook(root, "user-prompt", {"prompt": "yes %s" % req_id})
     assert "approved request %s" % req_id in out["hookSpecificOutput"]["additionalContext"]
     r = cli(root, "apply", req_id)
     assert r.returncode == 0, r.stdout
@@ -86,7 +94,7 @@ def test_declined_request_is_dropped(repo):
     _setup(root)
     ledger.append(root, "T", "b", os_lock=False)
     req_id = cli(root, "request", "ledger-delete", "1", "--reason", "x").stdout.split()[1]
-    hook(root, "user-prompt", {"prompt": "no, keep it"})
+    hook(root, "user-prompt", {"prompt": "no %s, keep it" % req_id})
     assert cli(root, "apply", req_id).returncode == 3
     assert ledger.entry_count(root) == 1
 
@@ -100,11 +108,25 @@ def test_loosening_needs_approval_tightening_does_not(repo):
     assert cli(root, "levels", "duplicates", "block").returncode == 0
     assert config.level(config.load(root), "duplicates") == "block"
     req_id = cli(root, "request", "loosen", "tests", "warn", "--reason", "no db here").stdout.split()[1]
-    hook(root, "user-prompt", {"prompt": "go ahead"})
+    hook(root, "user-prompt", {"prompt": "go ahead %s" % req_id})
     assert cli(root, "apply", req_id).returncode == 0
     assert config.level(config.load(root), "tests") == "warn"
-    # the user's own terminal is not gated
-    assert cli(root, "levels", "lint", "off", claude=False).returncode == 0
+
+
+def test_users_own_terminal_is_not_gated(repo, monkeypatch):
+    from cockcage import cli as cc_cli
+    root = str(repo)
+    _setup(root)
+    monkeypatch.setattr(approvals, "claude_is_calling", lambda: False)
+    assert cc_cli.main(["levels", "lint", "off", "--root", root]) == 0
+    assert config.level(config.load(root), "lint") == "off"
+
+
+def test_no_terminal_counts_as_claude(repo):
+    root = str(repo)
+    _setup(root)
+    r = cli(root, "levels", "tests", "off", claude=False)   # CLAUDECODE removed, but no TTY attached
+    assert r.returncode == 3
 
 
 def test_config_migration_v1_to_v2(tmp_path):
