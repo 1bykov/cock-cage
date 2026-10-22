@@ -1,0 +1,16 @@
+{
+  "name": "cock-cage",
+  "owner": {
+    "name": "Igor Bykov",
+    "url": "https://github.com/1bykov"
+  },
+  "description": "Personal marketplace for the cock-cage plugin.",
+  "plugins": [
+    {
+      "name": "cock-cage",
+      "source": "./plugins/cock-cage",
+      "description": "Guardrails, baseline checks, educational reports and versioning for Python projects.",
+      "category": "development"
+    }
+  ]
+}

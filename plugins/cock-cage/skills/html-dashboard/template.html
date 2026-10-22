@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root { --bg:#fafaf8; --card:#fff; --text:#1f1f1d; --muted:#6b6a65; --line:#e4e2dc; --accent:#2f6fde; --good:#1d8a5b; --bad:#c2412d; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#161615; --card:#1f1f1d; --text:#ecebe6; --muted:#a3a19a; --line:#34332f; --accent:#6b9cf0; --good:#4cc08a; --bad:#ef7a63; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }
+  main { max-width:1200px; margin:0 auto; padding:24px 16px 48px; }
+  h1 { font-size:22px; font-weight:600; margin:0 0 4px; }
+  .sub { color:var(--muted); margin:0 0 20px; font-size:13px; }
+  .kpis { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px; margin-bottom:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; }
+  .kpi .label { color:var(--muted); font-size:13px; }
+  .kpi .value { font-size:28px; font-weight:600; font-variant-numeric:tabular-nums; }
+  .kpi .delta { font-size:13px; }
+  .up { color:var(--good); } .down { color:var(--bad); }
+  .charts { display:grid; grid-template-columns:repeat(auto-fit,minmax(340px,1fr)); gap:12px; margin-bottom:16px; }
+  .chart-box { position:relative; min-height:260px; }
+  .summary { color:var(--muted); font-size:13px; margin:0 0 8px; }
+  table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+  th, td { text-align:left; padding:8px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:500; cursor:pointer; }
+  input[type=search] { width:100%; max-width:320px; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--text); margin-bottom:8px; }
+</style>
+</head>
+<body>
+<main>
+  <h1 id="title">Dashboard</h1>
+  <p class="sub" id="generated"></p>
+  <section class="kpis" id="kpis"></section>
+  <section class="charts" id="charts"></section>
+  <section class="card">
+    <input type="search" id="filter" placeholder="Filter rows" aria-label="Filter rows">
+    <div style="overflow-x:auto"><table id="table"></table></div>
+  </section>
+</main>
+<script>
+const DATA = /*__DATA__*/null;
+/* Expected shape:
+   { title, generated_at,
+     kpis:   [{label, value, display, delta, good_when:"up"|"down"}],
+     charts: [{id, type:"line"|"bar", title, summary, labels:[...], datasets:[{label, data:[...]}], horizontal:false}],
+     rows:   [{col: value, ...}] } */
+const fmt = new Intl.NumberFormat(undefined, { maximumFractionDigits: 1, notation: "compact" });
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+document.getElementById("title").textContent = DATA.title || "Dashboard";
+document.title = DATA.title || "Dashboard";
+document.getElementById("generated").textContent = DATA.generated_at ? "Generated " + DATA.generated_at : "";
+
+const kpis = document.getElementById("kpis");
+(DATA.kpis || []).forEach(k => {
+  const el = document.createElement("div");
+  el.className = "card kpi";
+  let delta = "";
+  if (typeof k.delta === "number") {
+    const up = k.delta >= 0, good = (k.good_when || "up") === "up" ? up : !up;
+    delta = `<div class="delta ${good ? "up" : "down"}">${up ? "▲" : "▼"} ${Math.abs(k.delta).toFixed(1)}%</div>`;
+  }
+  el.innerHTML = `<div class="label"></div><div class="value"></div>${delta}`;
+  el.querySelector(".label").textContent = k.label;
+  el.querySelector(".value").textContent = k.display ?? fmt.format(k.value);
+  kpis.appendChild(el);
+});
+
+const charts = document.getElementById("charts");
+(DATA.charts || []).forEach((c, i) => {
+  const box = document.createElement("div");
+  box.className = "card";
+  box.innerHTML = `<h2 style="font-size:16px;font-weight:600;margin:0 0 4px"></h2><p class="summary"></p><div class="chart-box"><canvas></canvas></div>`;
+  box.querySelector("h2").textContent = c.title || "";
+  box.querySelector(".summary").textContent = c.summary || "";
+  charts.appendChild(box);
+  const grey = css("--muted");
+  new Chart(box.querySelector("canvas"), {
+    type: c.type || "line",
+    data: { labels: c.labels, datasets: c.datasets.map((d, j) => ({
+      ...d, borderColor: j === 0 ? css("--accent") : grey, backgroundColor: j === 0 ? css("--accent") : grey,
+      borderWidth: 2, pointRadius: 0, tension: 0.25 })) },
+    options: { maintainAspectRatio: false, indexAxis: c.horizontal ? "y" : "x",
+      plugins: { legend: { display: c.datasets.length > 1, labels: { color: grey } } },
+      scales: { x: { ticks: { color: grey }, grid: { color: css("--line") } },
+                y: { beginAtZero: c.type === "bar", ticks: { color: grey, callback: v => fmt.format(v) }, grid: { color: css("--line") } } } }
+  });
+});
+
+const rows = DATA.rows || [];
+const cols = rows.length ? Object.keys(rows[0]) : [];
+let sortCol = null, asc = true;
+function renderTable() {
+  const q = document.getElementById("filter").value.toLowerCase();
+  let r = rows.filter(row => !q || cols.some(c => String(row[c]).toLowerCase().includes(q)));
+  if (sortCol) r = [...r].sort((a, b) => (a[sortCol] > b[sortCol] ? 1 : -1) * (asc ? 1 : -1));
+  const t = document.getElementById("table");
+  t.innerHTML = "";
+  const head = t.createTHead().insertRow();
+  cols.forEach(c => { const th = document.createElement("th"); th.textContent = c + (c === sortCol ? (asc ? " ▲" : " ▼") : "");
+    th.onclick = () => { asc = sortCol === c ? !asc : true; sortCol = c; renderTable(); }; head.appendChild(th); });
+  const body = t.createTBody();
+  r.slice(0, 500).forEach(row => { const tr = body.insertRow(); cols.forEach(c => { tr.insertCell().textContent = row[c]; }); });
+}
+document.getElementById("filter").addEventListener("input", renderTable);
+renderTable();
+</script>
+</body>
+</html>

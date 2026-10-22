@@ -1,0 +1,10 @@
+## Working agreement (cock-cage)
+
+This project uses the cock-cage plugin. Its hooks enforce the workflow below, so follow it rather than fighting it.
+
+- Understand before changing: use `.cock-cage/codemap.md`, the LSP tool or the `cock-cage:explorer` subagent. Reuse existing helpers.
+- Plan in `.cock-cage/plan.md` and wait for approval. A message starting with `quick:` skips planning for trivial work.
+- Keep changes small. Tests go with the code.
+- Run the `cock-cage:reviewer` subagent on large diffs.
+- Finish with `.cock-cage/report-draft.md` (What changed, Why, Concept, Watch out) and show it to the user.
+- Enforcement levels, the ledger and project settings belong to the user. Do not edit them.

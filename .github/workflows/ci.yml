@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["cock-cage--v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.9", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install pytest
+      - name: Unit and hook tests (macOS also exercises the append-only file flag)
+        run: python -m pytest -q tests
+      - name: Manifests agree on the version
+        run: |
+          python - <<'EOF'
+          import json, re
+          m = json.load(open("plugins/cock-cage/.claude-plugin/plugin.json"))
+          mk = json.load(open(".claude-plugin/marketplace.json"))
+          assert re.fullmatch(r"\d+\.\d+\.\d+", m["version"]), m["version"]
+          assert all("version" not in p for p in mk["plugins"]), "version belongs in plugin.json only"
+          print("version", m["version"])
+          EOF
+
+  e2e:
+    needs: tests
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - run: python -m pip install uv
+      - name: Real tools on an empty and an existing project
+        run: python tests/e2e/run_e2e.py "$RUNNER_TEMP/cc-e2e"
