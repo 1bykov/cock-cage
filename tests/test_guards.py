@@ -38,14 +38,14 @@ def test_secret_paths(path, secret):
     ("git clean -fd", ("dangerous", "deny")),
     ("git checkout -- .", ("dangerous", "deny")),
     ("cat .env", ("secrets", "deny")),
-    ("uv add requests", ("new_dependency", "ask")),
+    ("uv add requests", ("new_dependency", "ask")),  # level decides: warn by default since 0.2.0
     ("pip install pandas numpy", ("new_dependency", "ask")),
     ("python -m pip install httpx", ("new_dependency", "ask")),
     ("chflags nouappnd .cock-cage/reports.md", ("ledger_protection", "deny")),
     ("echo hi >> .cock-cage/reports.md", ("ledger_protection", "deny")),
     ("python3 tamper.py .cock-cage/state.json", ("ledger_protection", "deny")),
     ("cockcage ledger reseal", ("ledger_protection", "deny")),
-    ("python3 /x/cc.py levels tests off", ("ledger_protection", "deny")),
+    ("python3 /x/cc.py ledger unlock", ("ledger_protection", "deny")),
     ("rm -rf .cock-cage", ("ledger_protection", "deny")),
 ])
 def test_bash_blocked(ctx, cmd, expected):
@@ -56,7 +56,8 @@ def test_bash_blocked(ctx, cmd, expected):
     "rm -rf build/", "pytest -q", "ls -la", "git status", "git diff HEAD", "git log --oneline",
     "pip install -r requirements.txt", "pip install -e .", "uv sync", "cat .cock-cage/reports.md",
     "tail -n 20 .cock-cage/reports.md", "echo ok > /dev/null", "cp .env.example config.sample",
-    "git commit -m 'x'", "python3 script.py", "cockcage status",
+    "git commit -m 'x'", "python3 script.py", "cockcage status", "cockcage apply ab12cd",
+    "cockcage request loosen tests warn --reason flaky", "cockcage skill promote dash --yes", "cockcage publish patch",
 ])
 def test_bash_allowed(ctx, cmd):
     assert guards.bash_findings(cmd, ctx) == []

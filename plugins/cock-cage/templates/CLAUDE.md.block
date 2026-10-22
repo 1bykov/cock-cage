@@ -7,4 +7,5 @@ This project uses the cock-cage plugin. Its hooks enforce the workflow below, so
 - Keep changes small. Tests go with the code.
 - Run the `cock-cage:reviewer` subagent on large diffs.
 - Finish with `.cock-cage/report-draft.md` (What changed, Why, Concept, Watch out) and show it to the user.
-- Enforcement levels, the ledger and project settings belong to the user. Do not edit them.
+- Run cock-cage commands yourself (`.cock-cage/bin/cockcage`); the user does not use a terminal.
+- Deleting reports and loosening checks need the user's yes in chat via `cockcage request`. Never edit the ledger, config or settings directly.

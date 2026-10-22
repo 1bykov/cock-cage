@@ -7,8 +7,9 @@ from typing import Any, Callable, Dict, List, Tuple
 
 from . import util
 
-SCHEMA = 1
+SCHEMA = 2
 LEVELS = ("block", "warn", "report", "off")
+STRICTNESS = {"block": 3, "warn": 2, "report": 1, "off": 0}
 
 DEFAULTS: Dict[str, Any] = {
     "schema": SCHEMA,
@@ -22,11 +23,11 @@ DEFAULTS: Dict[str, Any] = {
         "report": "block",
         "secrets": "block",
         "dangerous": "block",
-        "new_dependency": "block",
         "large_read": "block",
         "review_large_diffs": "block",
         "ledger_protection": "block",
         # warn: Claude is told during work and the hook lists it in the report
+        "new_dependency": "warn",
         "duplicates": "warn",
         "dead_code": "warn",
         "complexity": "warn",
@@ -54,6 +55,7 @@ DEFAULTS: Dict[str, Any] = {
         "branch_prefix": "cc/",
         "auto_branch": True,
         "auto_checkpoint": True,
+        "auto_ship": True,
     },
     "ledger": {"os_lock": True},
 }
@@ -71,15 +73,24 @@ def _deep_merge(base: Dict[str, Any], over: Dict[str, Any]) -> Dict[str, Any]:
 
 # Each migration takes a raw config at schema N and returns it at schema N+1.
 # Append new ones here when the format changes; never edit old ones.
-MIGRATIONS: Dict[int, Callable[[Dict[str, Any]], Dict[str, Any]]] = {}
+def _v1_to_v2(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """0.2.0: Claude adds dependencies and merges finished work on its own (logged, not blocked)."""
+    levels = raw.setdefault("levels", {})
+    if levels.get("new_dependency", "block") == "block":
+        levels["new_dependency"] = "warn"
+    raw.setdefault("git", {}).setdefault("auto_ship", True)
+    return raw
+
+
+MIGRATIONS: Dict[int, Callable[[Dict[str, Any]], Dict[str, Any]]] = {1: _v1_to_v2}
 
 
 def migrate(raw: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     notes: List[str] = []
     cur = int(raw.get("schema", 0) or 0)
     if cur == 0:
-        raw["schema"] = 1
-        cur = 1
+        raw["schema"] = SCHEMA  # a fresh or hand-written config: current defaults apply
+        cur = SCHEMA
     while cur < SCHEMA:
         raw = MIGRATIONS[cur](raw)
         notes.append("config migrated from schema %d to %d" % (cur, cur + 1))

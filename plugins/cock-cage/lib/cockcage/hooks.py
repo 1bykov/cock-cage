@@ -10,7 +10,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional
 
-from . import checks, codemap, config, gitops, guards, initproj, ledger, plugin_version, report, state, util
+from . import approvals, checks, codemap, config, gitops, guards, initproj, ledger, plugin_version, report, state, util
 
 SCRIPT = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "scripts", "cc.py")
 
@@ -40,7 +40,8 @@ RULES = """cock-cage is active in this project. Follow this loop for any change 
 3. Build in small steps. Reuse before you write. Add or update tests with the code.
 4. If the diff exceeds {review} changed lines, run the cock-cage:reviewer subagent before finishing.
 5. Finish: write .cock-cage/report-draft.md (sections: What changed, Why, Concept, optional Watch out; at most {words} words; see the cock-cage reporting skill) and show it to the user. The Stop hook then runs tests, ruff and the type checker against the session baseline, adds machine-generated evidence, appends the report to the ledger and commits a checkpoint.
-Never modify .cock-cage/config.json, state.json, reports.md or ledger.seal, or project Claude settings. Enforcement levels are the user's to change."""
+You run every cock-cage command yourself with `.cock-cage/bin/cockcage` (status, release, skill promote, publish, request, apply); the user never needs a terminal. Finished tasks are merged into main automatically. Deleting ledger reports and loosening checks need the user's yes: file `cockcage request ...` and ask (see the cock-cage operating skill).
+Never modify .cock-cage/config.json, state.json, reports.md or ledger.seal, or project Claude settings directly."""
 
 
 # ---------------------------------------------------------------- SessionStart
@@ -56,9 +57,23 @@ def spawn_baseline(root: str) -> None:
         util.log_error(root, "spawn_baseline", exc)
 
 
+OFFER = (
+    "cock-cage (the user's guardrails plugin for Claude Code) is installed but not set up in this folder. "
+    "In your first reply, before anything else, ask the user in one short sentence whether to set it up here "
+    "(it installs dev tools, configures checks and commits only its own files). If they agree, run "
+    "`python3 \"{script}\" init` from the project root and summarise the result in a few lines. "
+    "If they decline or ignore it, carry on normally and do not ask again."
+)
+
+
 def session_start(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     root = util.project_root(payload)
     source = str(payload.get("source", "startup"))
+    if not _active(root):
+        if source == "startup" and approvals.folder_status(root) is None and approvals.looks_like_project(root):
+            approvals.set_folder_status(root, "offered")
+            return _ctx_out("SessionStart", OFFER.format(script=SCRIPT))
+        return None
     created = initproj.bootstrap(root)
     initproj.write_wrapper(root, SCRIPT)
     notes = config.load_and_migrate_on_disk(root)
@@ -66,20 +81,21 @@ def session_start(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     system: List[str] = []
     ctx: List[str] = [RULES.format(quick=cfg["quick_prefix"], review=cfg["review_diff_lines"], words=cfg["report_max_words"])]
     if created:
-        system.append("cock-cage set up .cock-cage/ in this project. Run /cock-cage:init to install the dev tools.")
+        ctx.append("cock-cage files were just created here. Run `python3 \"%s\" init` to install the dev tools." % SCRIPT)
     for n in notes:
         system.append("cock-cage: " + n)
 
     ok, problems = ledger.verify(root)
     if not ok:
-        system.append("cock-cage: the report ledger failed verification (%s). If you edited it, run "
-                      "`cockcage ledger reseal` in your terminal." % "; ".join(problems))
-        ctx.append("The report ledger failed verification. Do not attempt to repair it; the user will handle it.")
+        system.append("cock-cage: the report ledger failed verification (%s). If you edited it yourself, tell "
+                      "Claude and approve the reseal it asks for." % "; ".join(problems))
+        ctx.append("The report ledger failed verification (%s). Do not edit it. Tell the user, and if they say they "
+                   "edited it themselves, file `cockcage request ledger-reseal` and ask for their approval." % "; ".join(problems))
 
     missing = [t for t in ("pytest", "ruff", str(cfg.get("type_checker", "pyright"))) if t != "none"
                and not util.find_tool(root, t)]
     if missing:
-        ctx.append("Dev tools missing: %s. Suggest the user runs /cock-cage:init." % ", ".join(missing))
+        ctx.append("Dev tools missing: %s. Run `python3 \"%s\" init` to install them before building." % (", ".join(missing), SCRIPT))
 
     try:
         info = codemap.build(root, cfg.get("src_dirs"))
@@ -110,16 +126,6 @@ def session_start(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 # ---------------------------------------------------------------- UserPromptSubmit
 
-def _is_approval(prompt: str, words: List[str]) -> bool:
-    p = prompt.strip().lower()
-    if p.startswith("/cock-cage:approve") or p.startswith("approved. the user has approved the plan"):
-        return True
-    if len(p) > 80 or "?" in p or re.search(r"\b(but|except|instead|however|change|don't|do not|not yet|wait)\b", p):
-        return False
-    p = re.sub(r"^[^a-z]+", "", p)
-    return any(re.match(r"^%s\b" % re.escape(w), p) for w in words)
-
-
 def _start_task(root: str, st: Dict[str, Any], phase: str, title: str) -> None:
     task = st["task"]
     task["phase"] = phase
@@ -128,24 +134,50 @@ def _start_task(root: str, st: Dict[str, Any], phase: str, title: str) -> None:
         task["started_at"] = util.now_iso()
         task["start_commit"] = gitops.head(root)
         task["start_untracked"] = gitops.untracked(root)
+        task["dirty_at_start"] = gitops.dirty_paths(root)
+
+
+def _folder_reply(root: str, prompt: str) -> Optional[Dict[str, Any]]:
+    status = approvals.folder_status(root)
+    words = list(config.DEFAULTS["approve_words"]) + ["sure", "ok", "okay", "please do", "set it up"]
+    pending = status in ("offered", "asked")
+    if approvals.asks_for_setup(prompt) or (pending and approvals.is_affirmative(prompt, words)):
+        approvals.set_folder_status(root, "approved")
+        return _ctx_out("UserPromptSubmit", "cock-cage: the user agreed to set it up. Run `python3 \"%s\" init` "
+                        "from the project root now, summarise the result, then continue with their request." % SCRIPT)
+    if pending and approvals.is_negative(prompt):
+        approvals.set_folder_status(root, "declined")
+    return None
 
 
 def user_prompt(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     root = util.project_root(payload)
-    if not _active(root):
-        return None
-    cfg = config.load(root)
     prompt = str(payload.get("prompt") or "")
+    if not _active(root):
+        return _folder_reply(root, prompt)
+    cfg = config.load(root)
+    words = list(cfg.get("approve_words", []))
     quick = str(cfg.get("quick_prefix", "quick:")).lower()
     plan_exists = os.path.exists(util.cc_path(root, "plan.md"))
     with state.locked(root) as st:
         phase = st["task"]["phase"]
+        req = st.get("request")
+        if req and not req.get("approved_at"):
+            if approvals.is_affirmative(prompt, words):
+                approvals.approve_pending(st)
+                return _ctx_out("UserPromptSubmit", "cock-cage: the user approved request %s (%s). Run "
+                                "`.cock-cage/bin/cockcage apply %s` now." % (req["id"], approvals.describe(req), req["id"]))
+            if approvals.is_negative(prompt):
+                st["request"] = None
+                return _ctx_out("UserPromptSubmit", "cock-cage: the user declined request %s. Drop it." % req["id"])
         if prompt.strip().lower().startswith(quick):
             title = prompt.strip()[len(quick):].strip().splitlines()[0][:72] if prompt.strip()[len(quick):].strip() else "quick change"
             _start_task(root, st, "quick", title)
+            br = gitops.ensure_task_branch(root, title, cfg)
             return _ctx_out("UserPromptSubmit", "cock-cage: quick mode for this task. The plan gate is off; "
-                            "tests, checks and the report still apply when you finish.")
-        if plan_exists and phase in ("idle", "planning") and _is_approval(prompt, list(cfg.get("approve_words", []))):
+                            "tests, checks and the report still apply when you finish."
+                            + (" Work moved to branch %s." % br if br else ""))
+        if plan_exists and phase in ("idle", "planning") and approvals.is_affirmative(prompt, words):
             title = _plan_title(root) or "task"
             _start_task(root, st, "approved", title)
             br = gitops.ensure_task_branch(root, title, cfg)
@@ -156,6 +188,11 @@ def user_prompt(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if phase == "planning":
             return _ctx_out("UserPromptSubmit", "cock-cage: the plan is awaiting approval. If the user is giving "
                             "feedback, revise .cock-cage/plan.md and ask again.")
+        touched = st["task"].get("touched", [])
+        if phase in ("approved", "quick") and touched and not os.path.exists(report.draft_path(root)):
+            return _ctx_out("UserPromptSubmit", "cock-cage: task '%s' is in progress (%d file%s changed). When it is "
+                            "finished, write .cock-cage/report-draft.md so it is checked, committed and merged." % (
+                                st["task"].get("title") or "current task", len(touched), "" if len(touched) == 1 else "s"))
     return None
 
 
@@ -207,15 +244,21 @@ def _remember_format_state(root: str, tin: Dict[str, Any], st: Dict[str, Any]) -
     The Stop hook formats only those files (and new ones), so touching one line of a legacy
     file never reformats the whole thing.
     """
-    p = str(tin.get("file_path") or "")
-    if not p.endswith(".py"):
+    p = str(tin.get("file_path") or tin.get("notebook_path") or "")
+    if not p:
         return
     ap = os.path.abspath(p if os.path.isabs(p) else os.path.join(root, p))
     relp = util.rel(root, ap)
     if relp in st["task"].get("fmt", {}) or not util.is_inside(root, ap):
         return
     if not os.path.exists(ap):
-        formatted = True  # a new file: Claude's own code, format freely
+        with state.locked(root) as s2:
+            if relp not in s2["task"].setdefault("created", []):
+                s2["task"]["created"].append(relp)
+    if not relp.endswith(".py"):
+        return
+    if not os.path.exists(ap):
+        formatted = True  # a new file: Claude's own code, format and fix freely
     else:
         ruff = util.find_tool(root, "ruff")
         formatted = bool(ruff) and util.run([ruff, "format", "--check", "--quiet", relp], cwd=root, timeout=20)[0] == 0
@@ -333,6 +376,15 @@ def _format_block(blocking: Dict[str, List[str]]) -> str:
 def stop(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     root = util.project_root(payload)
     if not _active(root):
+        # Enforce the one-time offer: if Claude's first reply skipped it, send it back once to ask.
+        if approvals.folder_status(root) == "offered":
+            approvals.set_folder_status(root, "asked")
+            last = str(payload.get("last_assistant_message") or "")
+            if not approvals.CC_MENTION_RE.search(last):
+                return {"decision": "block", "reason": (
+                    "Before finishing, ask the user in one short sentence whether to set up cock-cage (their "
+                    "guardrails plugin) in this folder. It installs dev tools, configures checks and commits only "
+                    "its own files. Ask once; if they decline, never ask again.")}
         return None
     cfg = config.load(root)
     st = state.load(root)
@@ -340,30 +392,39 @@ def stop(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     touched = [t for t in task.get("touched", [])]
     draft_text = util.read_text(report.draft_path(root))
     if not touched and not draft_text:
+        if task.get("phase") == "quick":  # a quick question that changed nothing: the quick task is over
+            with state.locked(root) as s2:
+                state.reset_task(s2)
         return None
-    last = str(payload.get("last_assistant_message") or "").strip()
-    if last.endswith("?") and not draft_text:
-        return None  # Claude is pausing to ask the user something mid-task
+    if not draft_text:
+        # Work in progress (multi-step tasks, questions to the user). The task is finalised, checked
+        # and committed only once Claude writes the report; until then nothing is blocked.
+        n = len(touched)
+        return {"systemMessage": "cock-cage: task in progress, %d file%s changed, not reported yet." % (n, "" if n == 1 else "s")}
 
     giving_up = bool(payload.get("stop_hook_active")) and int(task.get("stop_blocks", 0)) >= int(cfg.get("max_stop_blocks", 3))
 
-    # Tidy touched Python files before measuring: safe autofixes everywhere Claude touched,
-    # formatting only where the file was already formatted (or is new).
+    # Tidy before measuring. Safe autofixes only in files Claude created; formatting only where the
+    # file was already formatted (so only Claude's lines can change) or is new. Code the task did not
+    # write is never rewritten.
     tidy: List[str] = []
     ruff = util.find_tool(root, "ruff")
+    created = set(task.get("created", []))
+    py_new = [t for t in touched if t.endswith(".py") and t in created and os.path.exists(os.path.join(root, t))]
     py_touched = [t for t in touched if t.endswith(".py") and os.path.exists(os.path.join(root, t))]
     if ruff and py_touched and config.level(cfg, "lint") != "off":
-        def _count() -> int:
-            code, out, _ = util.run([ruff, "check", "--output-format", "json", "--exit-zero", "--no-fix"] + py_touched, cwd=root, timeout=60)
-            try:
-                return len(json.loads(out or "[]"))
-            except ValueError:
-                return 0
-        before = _count()
-        util.run([ruff, "check", "--fix", "--quiet", "--exit-zero"] + py_touched, cwd=root, timeout=60)
-        fixed = before - _count()
-        if fixed > 0:
-            tidy.append("ruff auto-fixed %d issue%s in touched files" % (fixed, "" if fixed == 1 else "s"))
+        if py_new:
+            def _count() -> int:
+                code, out, _ = util.run([ruff, "check", "--output-format", "json", "--exit-zero", "--no-fix"] + py_new, cwd=root, timeout=60)
+                try:
+                    return len(json.loads(out or "[]"))
+                except ValueError:
+                    return 0
+            before = _count()
+            util.run([ruff, "check", "--fix", "--quiet", "--exit-zero"] + py_new, cwd=root, timeout=60)
+            fixed = before - _count()
+            if fixed > 0:
+                tidy.append("ruff auto-fixed %d issue%s in new files" % (fixed, "" if fixed == 1 else "s"))
         fmt_ok = [t for t in py_touched if task.get("fmt", {}).get(t, False)]
         if fmt_ok:
             code, out, _ = util.run([ruff, "format", "--check", "--quiet"] + fmt_ok, cwd=root, timeout=60)
@@ -385,8 +446,8 @@ def stop(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         lv = config.level(cfg, name)
         if lv == "block" and not have_baseline and name == "tests":
             lv = "warn"  # cannot attribute failures without a baseline
-        if lv == "block" and not have_baseline and name in ("lint", "types"):
-            items = [i for i in items if i.split(":", 1)[0] in touched]
+        if name in ("lint", "types", "dead_code"):
+            items = [i for i in items if i.split(":", 1)[0] in touched]  # never blame the task for other files
             if not items:
                 continue
         {"block": blocking, "warn": warnings, "report": noted}.get(lv, {}).setdefault(name, []).extend(items)
@@ -434,10 +495,14 @@ def stop(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if audit.get("ran") and audit.get("items") and config.level(cfg, "vulns") != "off":
         noted["vulnerable dependencies"] = list(audit["items"])
 
-    # Checkpoint commit, then ledger entry.
-    now_untracked = set(gitops.untracked(root))
-    new_files = sorted(f for f in now_untracked - set(task.get("start_untracked", [])) if not f.startswith(util.CC_DIR))
-    commit_paths = sorted(set(touched) | set(new_files))
+    # Checkpoint commit (only files Claude wrote, never ones the user had uncommitted work in), then ledger.
+    dirty_before = set(task.get("dirty_at_start", []))
+    held_back = sorted(t for t in touched if t in dirty_before and t not in created)
+    if held_back:
+        warnings.setdefault("left uncommitted", []).append(
+            "%s had your uncommitted changes before this task, so it was not committed; Claude's edits sit alongside yours"
+            % ", ".join(held_back))
+    commit_paths = gitops.committable(root, [t for t in touched if t not in held_back])
     title_guess = report.parse(draft_text)[0] or task.get("title") or _plan_title(root) or "task"
     sha = None
     if cfg["git"].get("auto_checkpoint", True):
@@ -449,7 +514,14 @@ def stop(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     evidence.extend(tidy)
     if not have_baseline:
         evidence.append("baseline: %s, so findings could not all be attributed to this task" % bstatus)
-    meta = {"branch": gitops.branch(root), "commit": sha or "", "mode": task.get("phase", ""),
+    task_branch = gitops.branch(root)
+    merged = ""
+    if sha and not giving_up and cfg["git"].get("auto_ship", True) and task_branch.startswith(cfg["git"].get("branch_prefix", "cc/")):
+        ok, merged = gitops.merge_into_protected(root, task_branch, cfg["git"].get("protected_branches", ["main", "master"]))
+        if not ok:
+            warnings.setdefault("merge", []).append(merged)
+            merged = "no (kept %s)" % task_branch
+    meta = {"branch": task_branch, "commit": sha or "", "merged": merged, "mode": task.get("phase", ""),
             "cock-cage": plugin_version()}
     title, body = report.compose(draft_text or "# %s\n" % title_guess, title_guess, meta, evidence, warnings, noted)
     if giving_up:
@@ -469,8 +541,9 @@ def stop(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         s2["baseline"]["at"] = cur.get("at")
         s2["baseline_status"] = "ready"
     n_warn = sum(len(v) for v in warnings.values())
-    msg = "cock-cage: report #%d logged%s. %s%s" % (
-        n, " · commit %s" % sha if sha else "", "; ".join(checks.summary_line(cur, base, have_baseline)[:2]),
+    msg = "cock-cage: report #%d logged%s%s. %s%s" % (
+        n, " · commit %s" % sha if sha else "", " · merged into %s" % merged if merged and not merged.startswith("no") else "",
+        "; ".join(checks.summary_line(cur, base, have_baseline)[:2]),
         " · %d warning%s" % (n_warn, "" if n_warn == 1 else "s") if n_warn else "")
     return {"systemMessage": msg}
 

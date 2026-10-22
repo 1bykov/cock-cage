@@ -11,7 +11,10 @@ import shutil
 import sys
 from typing import Any, Dict, List, Optional
 
-from . import PLUGIN_ROOT, checks, codemap, config, gitops, initproj, ledger, plugin_version, state, util, versioning
+from . import PLUGIN_ROOT, approvals, checks, codemap, config, gitops, initproj, ledger, plugin_version, state, util, versioning
+
+MARKETPLACE_REPO = initproj.MARKETPLACE_REPO
+SRC_DEFAULT = os.path.join(util.user_dir(), "src")
 
 
 def _root(args: argparse.Namespace) -> str:
@@ -65,6 +68,10 @@ def cmd_baseline(args: argparse.Namespace) -> int:
 
 def cmd_init(args: argparse.Namespace) -> int:
     root = _root(args)
+    status = approvals.folder_status(root)
+    if approvals.claude_is_calling() and not os.path.isdir(util.cc_path(root)) and status in ("offered", "asked", "declined"):
+        print("Not set up: the user has not agreed to cock-cage in this folder. Ask them first.")
+        return 3
     print("cock-cage %s: setting up %s" % (plugin_version(), root))
     ok, log = initproj.init(root, pm=args.pm, tools=not args.no_tools, commit=not args.no_commit,
                             type_checker=args.type_checker)
@@ -78,6 +85,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         b = state.load(root).get("baseline") or {}
         for line in checks.summary_line(b, {}, False):
             print("  - " + line)
+    approvals.set_folder_status(root, "set-up")
     print("Done." if ok else "Finished with problems; see above.")
     return 0 if ok else 1
 
@@ -85,7 +93,7 @@ def cmd_init(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     root = _root(args)
     if not os.path.isdir(util.cc_path(root)):
-        print("cock-cage is not set up here. Run: cockcage init")
+        print("cock-cage is not set up here. Run: cockcage init (after the user agrees)")
         return 1
     cfg = config.load(root)
     st = state.load(root)
@@ -103,7 +111,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
-# ---------------------------------------------------------------- ledger (user only)
+# ---------------------------------------------------------------- ledger (unlock, lock and reseal need the user)
 
 def cmd_ledger(args: argparse.Namespace) -> int:
     root = _root(args)
@@ -115,6 +123,10 @@ def cmd_ledger(args: argparse.Namespace) -> int:
     if args.action == "show":
         print(ledger.last_entry(root) or "no entries yet")
         return 0
+    if args.action in ("unlock", "lock", "reseal") and approvals.claude_is_calling():
+        print("Ledger surgery needs the user's yes. File `cockcage request ledger-delete <n>...` or "
+              "`cockcage request ledger-reseal`, ask them, then run `cockcage apply <id>`.")
+        return 3
     if args.action == "unlock":
         ledger.unlock(root)
         print("Unlocked. Edit .cock-cage/reports.md, then run: cockcage ledger reseal")
@@ -129,7 +141,7 @@ def cmd_ledger(args: argparse.Namespace) -> int:
     return 2
 
 
-# ---------------------------------------------------------------- levels (user only)
+# ---------------------------------------------------------------- levels (loosening needs the user)
 
 def cmd_levels(args: argparse.Namespace) -> int:
     root = _root(args)
@@ -138,6 +150,11 @@ def cmd_levels(args: argparse.Namespace) -> int:
         if args.name not in config.DEFAULTS["levels"] or args.level not in config.LEVELS:
             print("usage: cockcage levels <check> <block|warn|report|off>; checks: %s" % ", ".join(config.DEFAULTS["levels"]))
             return 2
+        old = config.level(config.load(root), args.name)
+        if config.STRICTNESS[args.level] < config.STRICTNESS[old] and approvals.claude_is_calling():
+            print("Loosening '%s' from %s to %s needs the user's yes. File `cockcage request loosen %s %s "
+                  "--reason \"...\"`, ask them, then run `cockcage apply <id>`." % (args.name, old, args.level, args.name, args.level))
+            return 3
         raw.setdefault("levels", {})[args.name] = args.level
         util.write_json(config.path(root), raw)
     cfg = config.load(root)
@@ -149,7 +166,7 @@ def cmd_levels(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------- skills
 
 def _source_skills_dir(explicit: Optional[str]) -> Optional[str]:
-    src = explicit or util.user_settings().get("source_repo")
+    src = explicit or util.user_settings().get("source_repo") or (SRC_DEFAULT if os.path.isdir(SRC_DEFAULT) else None)
     if not src:
         return None
     d = os.path.join(os.path.expanduser(src), "plugins", "cock-cage", "skills")
@@ -190,13 +207,14 @@ def cmd_skill(args: argparse.Namespace) -> int:
             return 1
         dest_root = _source_skills_dir(args.source)
         if not dest_root:
-            print("Set your local clone first: cockcage config source-repo ~/path/to/cock-cage")
+            print("No cock-cage source clone found. Run: cockcage bootstrap")
             return 1
         dest = os.path.join(dest_root, args.name)
         old = util.read_text(os.path.join(dest, "SKILL.md")).splitlines(keepends=True)
         new = util.read_text(os.path.join(src, "SKILL.md")).splitlines(keepends=True)
         sys.stdout.writelines(difflib.unified_diff(old, new, "current/SKILL.md", "draft/SKILL.md"))
-        if not args.yes and input("\nPromote this skill into %s? [y/N] " % dest).strip().lower() != "y":
+        if not (args.yes or approvals.claude_is_calling() or not sys.stdin.isatty()) and \
+                input("\nPromote this skill into %s? [y/N] " % dest).strip().lower() != "y":
             print("Not promoted.")
             return 1
         if os.path.isdir(dest):
@@ -207,7 +225,7 @@ def cmd_skill(args: argparse.Namespace) -> int:
         verb = "update" if old else "add"
         util.run(["git", "commit", "-q", "-m", "feat(skills): %s %s" % (verb, args.name), "--", dest], cwd=repo)
         shutil.rmtree(src)
-        print("Promoted and committed in %s.\nRelease it to your projects with: python3 scripts/release.py patch --push" % repo)
+        print("Promoted and committed in %s. Publish it to every project with: cockcage publish patch" % repo)
         return 0
     return 2
 
@@ -236,30 +254,14 @@ def cmd_ship(args: argparse.Namespace) -> int:
     br = gitops.branch(root)
     prefix = cfg["git"].get("branch_prefix", "cc/")
     if not br.startswith(prefix):
-        print("You are on '%s', not a %s task branch." % (br, prefix))
+        print("You are on '%s', not a %s task branch." % (br or "a detached HEAD", prefix))
         return 1
     if gitops.git(root, "status", "--porcelain", "--untracked-files=no")[1].strip():
         print("Commit or stash tracked changes first.")
         return 1
-    target = next((b for b in cfg["git"]["protected_branches"]
-                   if gitops.git(root, "rev-parse", "--verify", "--quiet", "refs/heads/" + b)[0] == 0), None)
-    if not target:
-        print("No protected branch (main/master) found to merge into.")
-        return 1
-    gitops.git(root, "switch", target)
-    if args.squash:
-        code, out, err = gitops.git(root, "merge", "--squash", br)
-        if code == 0:
-            subj = gitops.git(root, "log", "-1", "--pretty=%s", br)[1].strip()
-            code, out, err = util.run(["git"] + gitops._id_args(root) + ["commit", "-q", "-m", subj], cwd=root)
-    else:
-        code, out, err = util.run(["git"] + gitops._id_args(root) + ["merge", "--no-ff", "-q", "-m", "Merge %s" % br, br], cwd=root)
-    if code != 0:
-        print("Merge failed, nothing deleted:\n" + (err or out))
-        return 1
-    gitops.git(root, "branch", "-D" if args.squash else "-d", br)
-    print("Merged %s into %s and deleted the branch." % (br, target))
-    return 0
+    ok, msg = gitops.merge_into_protected(root, br, cfg["git"]["protected_branches"])
+    print(("Merged %s into %s and deleted the branch." % (br, msg)) if ok else ("Not merged: %s" % msg))
+    return 0 if ok else 1
 
 
 def cmd_release(args: argparse.Namespace) -> int:
@@ -278,6 +280,145 @@ def cmd_codemap(args: argparse.Namespace) -> int:
     info = codemap.build(root, config.load(root).get("src_dirs"))
     print("codemap: %d files, %d symbols -> .cock-cage/codemap.md" % (info["files"], info["symbols"]))
     return 0
+
+
+# ---------------------------------------------------------------- chat-approved requests
+
+def cmd_request(args: argparse.Namespace) -> int:
+    root = _root(args)
+    if args.action == "ledger-delete":
+        nums = [int(x.lstrip("#")) for x in args.items if x.lstrip("#").isdigit()]
+        if not nums:
+            print("usage: cockcage request ledger-delete <n> [<n>...] --reason \"...\"")
+            return 2
+        payload: Dict[str, Any] = {"entries": nums}
+    elif args.action == "loosen":
+        if len(args.items) != 2 or args.items[0] not in config.DEFAULTS["levels"] or args.items[1] not in config.LEVELS:
+            print("usage: cockcage request loosen <check> <warn|report|off> --reason \"...\"")
+            return 2
+        old = config.level(config.load(root), args.items[0])
+        if config.STRICTNESS[args.items[1]] >= config.STRICTNESS[old]:
+            print("That is not a loosening; run `cockcage levels %s %s` directly." % tuple(args.items))
+            return 2
+        payload = {"check": args.items[0], "old": old, "new": args.items[1]}
+    else:
+        payload = {}
+    if not args.reason.strip():
+        print("Give a --reason the user can judge.")
+        return 2
+    with state.locked(root) as st:
+        req = approvals.create(st, args.action, payload, args.reason)
+    print("Request %s filed: %s. Reason: %s" % (req["id"], approvals.describe(req), req["reason"]))
+    print("Now ask the user in plain words whether to %s, and wait for their reply. "
+          "If they agree, run: cockcage apply %s" % (approvals.describe(req), req["id"]))
+    return 0
+
+
+def cmd_apply(args: argparse.Namespace) -> int:
+    root = _root(args)
+    cfg = config.load(root)
+    lock_files = bool(cfg.get("ledger", {}).get("os_lock", True))
+    try:
+        with state.locked(root) as st:
+            req = approvals.consume(st, args.id)
+    except PermissionError as exc:
+        print("Refused: %s." % exc)
+        return 3
+    if req["action"] == "ledger-delete":
+        try:
+            n = ledger.delete_entries(root, req["args"]["entries"], lock_files)
+        except ValueError as exc:
+            print("Nothing deleted: %s" % exc)
+            return 1
+        print("Deleted %s. The ledger now has %d entries and verifies." % (approvals.describe(req).split(" from")[0], n))
+    elif req["action"] == "ledger-unlock":
+        ledger.unlock(root)
+        print("The ledger's append-only lock is lifted. It returns at the next report or reseal.")
+    elif req["action"] == "ledger-reseal":
+        n = ledger.reseal(root, lock_files)
+        print("Resealed the ledger with %d entries." % n)
+    elif req["action"] == "loosen":
+        raw = util.read_json(config.path(root), {}) or {}
+        raw.setdefault("levels", {})[req["args"]["check"]] = req["args"]["new"]
+        util.write_json(config.path(root), raw)
+        print("Changed '%s' from %s to %s." % (req["args"]["check"], req["args"]["old"], req["args"]["new"]))
+    return 0
+
+
+# ---------------------------------------------------------------- machine setup and publishing
+
+def _settings_json() -> str:
+    return os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
+
+
+def cmd_bootstrap(args: argparse.Namespace) -> int:
+    """One-time machine setup, safe to re-run: source clone, marketplace, user-scope install, auto-update, LSP."""
+    log: List[str] = []
+    src = os.path.expanduser(args.src or SRC_DEFAULT)
+    if os.path.isdir(os.path.join(src, ".git")):
+        code, out, err = util.run(["git", "-C", src, "pull", "--ff-only", "--quiet"], cwd=src, timeout=120)
+        log.append("source clone %s: %s" % (src, "updated" if code == 0 else "pull failed: " + (err or out).strip()[:200]))
+    else:
+        os.makedirs(os.path.dirname(src), exist_ok=True)
+        code, out, err = util.run(["git", "clone", "--quiet", "https://github.com/%s" % MARKETPLACE_REPO, src], cwd=os.path.dirname(src), timeout=300)
+        log.append("source clone %s: %s" % (src, "cloned" if code == 0 else "clone failed: " + (err or out).strip()[:200]))
+    data = util.user_settings()
+    data["source_repo"] = src
+    util.write_json(os.path.join(util.user_dir(), "settings.json"), data)
+
+    claude = shutil.which("claude")
+    if not claude:
+        log.append("claude CLI not on PATH: skipped marketplace and plugin install")
+    else:
+        code, out, _ = util.run([claude, "plugin", "marketplace", "list"], cwd=src, timeout=60)
+        if "cock-cage" not in out:
+            code, out, err = util.run([claude, "plugin", "marketplace", "add", MARKETPLACE_REPO], cwd=src, timeout=180)
+            log.append("marketplace add: %s" % ("ok" if code == 0 else (err or out).strip()[-200:]))
+        else:
+            util.run([claude, "plugin", "marketplace", "update", "cock-cage"], cwd=src, timeout=180)
+            log.append("marketplace: already registered, refreshed")
+        code, out, err = util.run([claude, "plugin", "install", "cock-cage@cock-cage", "--scope", "user"], cwd=src, timeout=180)
+        log.append("plugin install (user scope): %s" % ("ok" if code == 0 else (err or out).strip()[-200:]))
+    sp = _settings_json()
+    settings = util.read_json(sp, {}) or {}
+    mk = settings.setdefault("extraKnownMarketplaces", {}).setdefault("cock-cage", {})
+    mk.setdefault("source", {"source": "github", "repo": MARKETPLACE_REPO})
+    if mk.get("autoUpdate") is not True:
+        mk["autoUpdate"] = True
+        util.write_json(sp, settings)
+        log.append("auto-update: enabled for the cock-cage marketplace")
+    if not args.no_lsp:
+        if not shutil.which("pyright-langserver") and shutil.which("uv"):
+            code, _, err = util.run(["uv", "tool", "install", "pyright"], cwd=src, timeout=300)
+            log.append("pyright language server: %s" % ("installed" if code == 0 else err.strip()[-200:]))
+        if claude:
+            code, _, _ = util.run([claude, "plugin", "marketplace", "update", "claude-plugins-official"], cwd=src, timeout=180)
+            if code != 0:
+                util.run([claude, "plugin", "marketplace", "add", "anthropics/claude-plugins-official"], cwd=src, timeout=180)
+            code, out, err = util.run([claude, "plugin", "install", "pyright-lsp@claude-plugins-official", "--scope", "user"], cwd=src, timeout=180)
+            log.append("pyright-lsp plugin: %s" % ("ok" if code == 0 else (err or out).strip()[-200:]))
+    for line in log:
+        print("  - " + line)
+    print("cock-cage is installed for every project on this machine. It loads in new Claude sessions "
+          "(or after /reload-plugins), and offers itself once in each project folder.")
+    return 0
+
+
+def cmd_publish(args: argparse.Namespace) -> int:
+    src = _source_skills_dir(None)
+    if not src:
+        print("No cock-cage source clone found. Run: cockcage bootstrap")
+        return 1
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(src)))
+    util.run(["git", "-C", repo, "pull", "--ff-only", "--quiet"], cwd=repo, timeout=120)
+    cmd = [sys.executable, os.path.join(repo, "scripts", "release.py"), args.part, "--push", "--update-local"]
+    if args.dry_run:
+        cmd = [sys.executable, os.path.join(repo, "scripts", "release.py"), args.part, "--dry-run"]
+    code, out, err = util.run(cmd, cwd=repo, timeout=1800)
+    print(out.strip())
+    if code != 0:
+        print(err.strip()[-1500:])
+    return code
 
 
 # ---------------------------------------------------------------- parser
@@ -342,6 +483,28 @@ def main(argv: Optional[List[str]] = None) -> int:
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("--root")
     s.set_defaults(fn=cmd_release)
+
+    s = sub.add_parser("request", help="file a request that needs the user's yes in chat")
+    s.add_argument("action", choices=["ledger-delete", "ledger-reseal", "ledger-unlock", "loosen"])
+    s.add_argument("items", nargs="*")
+    s.add_argument("--reason", default="")
+    s.add_argument("--root")
+    s.set_defaults(fn=cmd_request)
+
+    s = sub.add_parser("apply", help="carry out a request the user approved in chat")
+    s.add_argument("id")
+    s.add_argument("--root")
+    s.set_defaults(fn=cmd_apply)
+
+    s = sub.add_parser("bootstrap", help="one-time machine setup (safe to re-run)")
+    s.add_argument("--src", help="where to keep the cock-cage source clone (default ~/.cock-cage/src)")
+    s.add_argument("--no-lsp", action="store_true")
+    s.set_defaults(fn=cmd_bootstrap)
+
+    s = sub.add_parser("publish", help="release a new cock-cage version to all projects")
+    s.add_argument("part", choices=["patch", "minor", "major"])
+    s.add_argument("--dry-run", action="store_true")
+    s.set_defaults(fn=cmd_publish)
 
     s = sub.add_parser("codemap", help="rebuild .cock-cage/codemap.md")
     s.add_argument("--root")

@@ -104,6 +104,9 @@ def last_version_tag(root: str) -> Optional[str]:
 
 
 def release(root: str, part: str, dry_run: bool = False) -> List[str]:
+    dirty = [f for f in ("pyproject.toml", "CHANGELOG.md") if gitops.git(root, "status", "--porcelain", "--", f)[1].strip()]
+    if dirty and not dry_run:
+        raise ValueError("%s has uncommitted changes; commit or stash them before releasing" % ", ".join(dirty))
     cur = read_project_version(root)
     if cur is None:
         raise ValueError("pyproject.toml has no [project] version to bump")

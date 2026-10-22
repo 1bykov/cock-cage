@@ -18,14 +18,16 @@ CC_GITIGNORE = "# Only config.json is shared. Ledger, state, plans and caches st
 ROOT_GITIGNORE_LINES = [
     ".venv/", "venv/", "__pycache__/", "*.py[cod]", ".pytest_cache/", ".ruff_cache/", ".mypy_cache/",
     ".coverage", "coverage.json", "htmlcov/", "dist/", "build/", "*.egg-info/", ".env", ".env.*",
-    "!.env.example", ".DS_Store",
+    "!.env.example", ".DS_Store", "node_modules/", "*.pem", "*.key", "*.p12",
 ]
+
+VENDORED_DIRS = ("node_modules/", ".venv/", "venv/", "env/", "build/", "dist/", "__pycache__/", ".tox/", "site-packages/")
 
 CLAUDE_MD_START = "<!-- cock-cage:start -->"
 CLAUDE_MD_END = "<!-- cock-cage:end -->"
 
 TOOL_BLOCKS = {
-    "tool.ruff": '[tool.ruff]\nline-length = 100\n\n[tool.ruff.lint]\nselect = ["E", "F", "W", "I", "B", "UP", "SIM"]\n',
+    "tool.ruff": '[tool.ruff]\nline-length = 100\n{target}\n[tool.ruff.lint]\nselect = ["E", "F", "W", "I", "B", "UP", "SIM"]\n',
     "tool.pyright": '[tool.pyright]\nvenvPath = "."\nvenv = ".venv"\ntypeCheckingMode = "standard"\n',
     "tool.coverage.run": '[tool.coverage.run]\nomit = [".venv/*", "venv/*", "tests/*"]\n',
     "tool.pytest.ini_options": '[tool.pytest.ini_options]\npythonpath = ["."]\ntestpaths = ["tests"]\n',
@@ -85,9 +87,29 @@ def _ensure_root_gitignore(root: str) -> bool:
     return True
 
 
+def _toml_ok(text: str) -> bool:
+    try:
+        import tomllib  # type: ignore  # Python 3.11+
+    except ImportError:
+        return True  # cannot check on 3.9/3.10; the header family check below prevents the known clash
+    try:
+        tomllib.loads(text)
+        return True
+    except Exception:
+        return False
+
+
+def _requires_python(text: str) -> Optional[str]:
+    m = re.search(r'^requires-python\s*=\s*"([^"]+)"', text, re.M)
+    return m.group(1) if m else None
+
+
 def _ensure_tool_tables(root: str, type_checker: str) -> List[str]:
     p = os.path.join(root, "pyproject.toml")
-    text = util.read_text(p)
+    original = util.read_text(p)
+    if original and not _toml_ok(original):
+        return []  # never touch a pyproject that is already unparseable
+    text = original
     added = []
     for table, block in TOOL_BLOCKS.items():
         if table == "tool.pyright" and type_checker not in ("pyright", "basedpyright"):
@@ -97,13 +119,18 @@ def _ensure_tool_tables(root: str, type_checker: str) -> List[str]:
             or "[tool:pytest]" in util.read_text(os.path.join(root, "setup.cfg"))
         ):
             continue
-        if re.search(r"^\[%s\]" % re.escape(table), text, re.M):
+        family = table.split(".")[0] + r"\." + table.split(".")[1]  # tool.ruff -> any [tool.ruff...] table
+        if re.search(r"^\[\[?\s*%s[.\]\s]" % family, text, re.M):
             continue
+        if table == "tool.ruff":
+            block = block.format(target='' if _requires_python(text) else 'target-version = "py39"\n')
         if text and not text.endswith("\n"):
             text += "\n"
         text += ("\n" if text else "") + block
         added.append(table)
     if added:
+        if not _toml_ok(text):
+            return []
         util.write_text(p, text)
     return added
 
@@ -182,12 +209,7 @@ def _install_tools(root: str, pm: str, type_checker: str, log: List[str]) -> boo
 
 
 def _porcelain(root: str) -> Dict[str, str]:
-    code, out, _ = gitops.git(root, "status", "--porcelain", "--untracked-files=all")
-    res = {}
-    for l in out.splitlines():
-        if len(l) > 3:
-            res[l[3:].strip().strip('"')] = l[:2]
-    return res
+    return gitops.porcelain(root)
 
 
 # ---------------------------------------------------------------- init
@@ -234,15 +256,22 @@ def init(root: str, pm: str = "auto", tools: bool = True, commit: bool = True,
 
     if commit and gitops.is_repo(root):
         if unborn:
-            gitops.git(root, "add", "-A")
-            big = []
-            for f in gitops.git(root, "diff", "--cached", "--name-only")[1].splitlines():
-                fp = os.path.join(root, f)
-                if os.path.isfile(fp) and os.path.getsize(fp) > large_file_mb * 1024 * 1024:
-                    big.append(f)
+            from .guards import is_secret_path
+            candidates = sorted(_porcelain(root))
+            skipped_secret = [f for f in candidates if is_secret_path(f)]
+            skipped_vendor = [f for f in candidates if any(("/" + f).find("/" + v) >= 0 for v in VENDORED_DIRS)]
+            big = [f for f in candidates if os.path.isfile(os.path.join(root, f))
+                   and os.path.getsize(os.path.join(root, f)) > large_file_mb * 1024 * 1024]
+            leave = set(skipped_secret) | set(skipped_vendor) | set(big)
+            to_add = [f for f in candidates if f not in leave]
+            for i in range(0, len(to_add), 200):
+                gitops.git(root, "add", "--", *to_add[i:i + 200])
+            if skipped_secret:
+                log.append("left out of the first commit (look like secrets): %s" % ", ".join(skipped_secret[:10]))
             if big:
-                gitops.git(root, "reset", "-q", "--", *big)
-                log.append("left out of the first commit (over %d MB): %s" % (large_file_mb, ", ".join(big)))
+                log.append("left out of the first commit (over %d MB): %s" % (large_file_mb, ", ".join(big[:10])))
+            if skipped_vendor:
+                log.append("left out of the first commit (vendored or build folders): %d files" % len(skipped_vendor))
             code, _, err = util.run(["git"] + gitops._id_args(root) + ["commit", "-q", "-m", "chore: initial commit with cock-cage"], cwd=root)
             log.append("first commit: %s" % ("ok" if code == 0 else err.strip()[:200]))
         else:

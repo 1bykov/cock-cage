@@ -175,7 +175,7 @@ core = os.path.join(ex, "pricing", "core.py")
 d = hook(ex, "pre-tool", {"tool_name": "Edit", "tool_input": {"file_path": core}})
 expect(d and d["hookSpecificOutput"]["permissionDecision"] == "deny", "edit blocked before a plan")
 d = hook(ex, "pre-tool", {"tool_name": "Bash", "tool_input": {"command": "uv add requests"}})
-expect(d and d["hookSpecificOutput"]["permissionDecision"] == "ask", "new dependency needs the user's OK")
+expect(d is None, "adding a dependency is allowed (logged as a warning)")
 plan = os.path.join(ex, ".cock-cage", "plan.md")
 open(plan, "w").write("# Add discount helper\n\n## Goal\nA discount() function.\n")
 hook(ex, "post-tool", {"tool_name": "Write", "tool_input": {"file_path": plan}})
@@ -216,21 +216,6 @@ for f in (core, tests, legacy):
     fb_text += (fb or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
 expect("test_discount" in fb_text or "fail" in fb_text, "targeted tests ran after the edit and reported the failure")
 
-out = hook(ex, "stop", {"last_assistant_message": "Done."})
-reason = (out or {}).get("reason", "")
-print(textwrap.indent(reason[:900], "    "))
-expect(out and out.get("decision") == "block", "finish blocked")
-expect("test_discount" in reason, "new failing test blocks")
-expect("test_known_broken" not in reason, "pre-existing failure is not blamed on this task")
-expect("F841" in reason, "new unfixable lint error blocks")
-expect("No report" in reason, "missing report blocks")
-
-# second attempt: fixes everything, but 'cheats' by deleting the pre-existing broken test
-src = open(core).read().replace("    unused = 1\n", "").replace("return amount * (1 - pct)", "return round(amount * (1 - pct), 2)")
-open(core, "w").write(src)
-tsrc = open(tests).read().replace("== 91", "== 90.0")
-tsrc = tsrc.replace("\n\ndef test_known_broken():\n    assert vat(0.1, 0.0) == 0.2\n", "\n")
-open(tests, "w").write(tsrc)
 REPORT = textwrap.dedent("""\
     # Add discount helper
 
@@ -244,7 +229,24 @@ REPORT = textwrap.dedent("""\
     Floats cannot represent most decimal fractions exactly, so results are rounded to pence. See core.py discount().
 """)
 draft = os.path.join(ex, ".cock-cage", "report-draft.md")
+out = hook(ex, "stop", {"last_assistant_message": "Step 1 done, continuing next turn."})
+expect(out and "decision" not in out and "in progress" in out.get("systemMessage", ""), "mid-task turn end does not block")
 open(draft, "w").write(REPORT)
+out = hook(ex, "stop", {"last_assistant_message": "Done."})
+reason = (out or {}).get("reason", "")
+print(textwrap.indent(reason[:900], "    "))
+expect(out and out.get("decision") == "block", "finish blocked")
+expect("test_discount" in reason, "new failing test blocks")
+expect("test_known_broken" not in reason, "pre-existing failure is not blamed on this task")
+expect("F841" in reason, "new unfixable lint error blocks")
+
+# second attempt: fixes everything, but 'cheats' by deleting the pre-existing broken test
+src = open(core).read().replace("    unused = 1\n", "").replace("return amount * (1 - pct)", "return round(amount * (1 - pct), 2)")
+open(core, "w").write(src)
+tsrc = open(tests).read().replace("== 91", "== 90.0")
+tsrc = tsrc.replace("\n\ndef test_known_broken():\n    assert vat(0.1, 0.0) == 0.2\n", "\n")
+open(tests, "w").write(tsrc)
+
 out = hook(ex, "stop", {"last_assistant_message": "Done.", "stop_hook_active": True})
 reason = (out or {}).get("reason", "")
 print(textwrap.indent(reason, "    "))
@@ -257,6 +259,8 @@ out = hook(ex, "stop", {"last_assistant_message": "Done.", "stop_hook_active": T
 msg = (out or {}).get("systemMessage", "")
 print("    " + msg)
 expect("report #1 logged" in msg and "commit" in msg, "report logged and checkpoint committed")
+expect("merged into main" in msg and git(ex, "branch", "--show-current") == "main", "finished work merged into main automatically")
+expect("cc/add-discount-helper" not in git(ex, "branch"), "task branch deleted after merge")
 ledger_text = open(os.path.join(ex, ".cock-cage", "reports.md")).read()
 print(textwrap.indent(ledger_text.split("<!-- cc:entry")[1][:2000], "    | "))
 expect("baseline 1 passed, 1 failed" in ledger_text, "evidence compares against the baseline")
@@ -264,13 +268,11 @@ expect("removed tests (documented in report)" in ledger_text, "documented test r
 expect("same-shape functions" in ledger_text or "copy-paste" in ledger_text, "duplicate of parse_rows reported as a warning")
 expect("def old( a,b ):" in open(legacy).read(), "legacy file not reformatted wholesale")
 expect(sh([PY, CC, "ledger", "verify"], ex, check=False).returncode == 0, "ledger verifies")
-expect(git(ex, "log", "-1", "--pretty=%s") == "feat: Add discount helper", "conventional commit message")
+expect(git(ex, "log", "-1", "--pretty=%s") == "feat: Add discount helper", "conventional commit message on main (fast-forward)")
 
 # ------------------------------------------------------------------ 4. versioning
 
-print("\n[4] ship and release")
-out = sh([PY, CC, "ship"], ex, check=False)
-expect(out.returncode == 0 and git(ex, "branch", "--show-current") == "main", "ship merged the task branch into main")
+print("\n[4] release")
 out = sh([PY, CC, "release", "minor"], ex, check=False)
 print(textwrap.indent(out.stdout.strip(), "    "))
 expect('version = "0.4.0"' in open(os.path.join(ex, "pyproject.toml")).read(), "version bumped 0.3.0 -> 0.4.0")

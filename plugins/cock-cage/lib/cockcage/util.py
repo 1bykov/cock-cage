@@ -116,10 +116,12 @@ def project_python(root: str) -> str:
 
 
 def rel(root: str, path: str) -> str:
+    """Path relative to root, resolving symlinks on both sides (macOS /var vs /private/var)."""
     try:
-        return os.path.relpath(os.path.abspath(path), root)
+        r = os.path.relpath(os.path.realpath(os.path.abspath(path)), os.path.realpath(root))
     except ValueError:
         return path
+    return r
 
 
 def is_inside(root: str, path: str) -> bool:

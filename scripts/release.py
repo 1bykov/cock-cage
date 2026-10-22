@@ -39,6 +39,15 @@ def run(cmd, check=True):
     return p
 
 
+def test_command():
+    """pytest from this interpreter if available, else through uv, so a stock macOS python works."""
+    if subprocess.run([sys.executable, "-c", "import pytest"], capture_output=True).returncode == 0:
+        return [sys.executable, "-m", "pytest", "-q", "tests"]
+    if shutil.which("uv"):
+        return ["uv", "run", "--no-project", "--with", "pytest", "python", "-m", "pytest", "-q", "tests"]
+    sys.exit("pytest is not available (install uv or pytest); refusing to release untested code")
+
+
 def roll_changelog(new: str, since_tag: str) -> None:
     text = open(CHANGELOG).read() if os.path.exists(CHANGELOG) else "# Changelog\n\n## [Unreleased]\n"
     m = re.search(r"^## \[Unreleased\]\s*\n(.*?)(?=^## \[|\Z)", text, re.S | re.M)
@@ -60,6 +69,7 @@ def main() -> int:
     ap.add_argument("--push", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--skip-tests", action="store_true")
+    ap.add_argument("--update-local", action="store_true", help="refresh this machine's install after pushing")
     a = ap.parse_args()
 
     if run(["git", "status", "--porcelain"], check=False).stdout.strip() and not a.dry_run:
@@ -77,7 +87,7 @@ def main() -> int:
         print(versioning.changelog_section(REPO, new, last or None))
         return 0
     if not a.skip_tests:
-        run([sys.executable, "-m", "pytest", "-q", "tests"])
+        run(test_command())
     manifest["version"] = new
     with open(PLUGIN_JSON, "w") as fh:
         json.dump(manifest, fh, indent=2)
@@ -92,7 +102,11 @@ def main() -> int:
     run(["git", "tag", "-a", tag, "-m", "cock-cage v%s" % new])
     if a.push:
         run(["git", "push", "--follow-tags"])
-        print("Pushed. Projects with auto-update pick it up on their next session; others run /plugin to update.")
+        print("Pushed. Projects pick it up automatically (auto-update) at their next session.")
+        if a.update_local and shutil.which("claude"):
+            run(["claude", "plugin", "marketplace", "update", "cock-cage"], check=False)
+            run(["claude", "plugin", "update", "cock-cage@cock-cage"], check=False)
+            print("This machine now has v%s; it loads in new sessions or after /reload-plugins." % new)
     else:
         print("Tagged %s. Push with: git push --follow-tags" % tag)
     return 0

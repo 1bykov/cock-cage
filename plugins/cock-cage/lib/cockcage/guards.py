@@ -10,7 +10,7 @@ import re
 import shlex
 import tempfile
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from . import util
 
@@ -44,12 +44,11 @@ READONLY_PROGRAMS = {
 
 WRITE_PROGRAMS = {"tee", "cp", "mv", "rm", "touch", "truncate", "patch", "install", "ln", "dd", "rsync"}
 
-SHELL_WRAPPERS = {"sudo", "env", "time", "nohup", "command", "builtin", "exec", "nice", "caffeinate"}
+SHELL_WRAPPERS = {"env", "time", "nohup", "command", "builtin", "exec", "nice", "caffeinate", "xargs"}
 
-USER_ONLY_CLI = re.compile(
-    r"(cc\.py|cockcage)\b[^;&|\n]*\b(ledger\s+(unlock|reseal|lock)|skill\s+promote|ship|"
-    r"levels\s+[a-z_]+\s+(block|warn|report|off)|config\s+source-repo)\b"
-)
+# Raw ledger surgery has no approval path; Claude uses `cockcage request` + `cockcage apply` instead,
+# which the CLI only honours after the user's yes in chat.
+USER_ONLY_CLI = re.compile(r"(cc\.py|cockcage)\b[^;&|\n]*\bledger\s+(unlock|reseal|lock)\b")
 
 
 @dataclass
@@ -101,8 +100,10 @@ def is_protected(ctx: Context, ap: str) -> Optional[str]:
     if util.is_inside(claude_dir, ap) and os.path.basename(ap).startswith("settings"):
         return "project Claude settings control the cage itself"
     home_claude = os.path.expanduser("~/.claude")
-    if util.is_inside(home_claude, ap) and "/skills/" not in ap.replace(os.sep, "/"):
-        return "~/.claude holds your global Claude config and installed plugins"
+    if util.is_inside(home_claude, ap):
+        relh = os.path.relpath(os.path.realpath(ap), os.path.realpath(home_claude)).replace(os.sep, "/")
+        if relh.startswith("settings") or relh.startswith("plugins/") or relh == "plugins":
+            return "~/.claude settings and installed plugins control the cage itself"
     return None
 
 
@@ -140,30 +141,68 @@ def is_secret_path(p: str) -> bool:
 
 # ---------------------------------------------------------------- bash parsing
 
-_SPLIT_RE = re.compile(r"\s*(?:&&|\|\||;|\n|\|(?!\|))\s*")
-_REDIR_RE = re.compile(r"(?:^|[^0-9&>])(>>?|&>)\s*([^\s;&|<>]+)")
+CONTROL_OPS = {";", "&&", "||", "|", "&", "|&", ";;", "\n", "(", ")"}
+REDIRECT_OPS = {">", ">>", "&>", ">|", "&>>"}
+SHELLS = {"bash", "sh", "zsh", "dash"}
 
 
-def segments(cmd: str) -> List[str]:
-    return [s for s in _SPLIT_RE.split(cmd or "") if s.strip()]
+def _tokens(cmd: str) -> List[str]:
+    lx = shlex.shlex(cmd, posix=True, punctuation_chars=";&|<>()\n")
+    lx.whitespace = " \t\r"
+    lx.whitespace_split = True
+    return list(lx)
 
 
-def argv(segment: str) -> List[str]:
-    try:
-        toks = shlex.split(segment, posix=True)
-    except ValueError:
-        toks = segment.split()
-    # strip env assignments and wrappers
+def _strip_wrappers(toks: List[str]) -> List[str]:
     while toks and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[0]) or toks[0] in SHELL_WRAPPERS):
-        if toks[0] in ("env",) and len(toks) > 1 and toks[1].startswith("-"):
+        if toks[0] == "env" and len(toks) > 1 and toks[1].startswith("-"):
             toks = toks[2:]
             continue
         toks = toks[1:]
     return toks
 
 
-def redirect_targets(segment: str) -> List[str]:
-    return [m.group(2) for m in _REDIR_RE.finditer(segment) if m.group(2) not in ("/dev/null", "&1", "&2")]
+def parse_commands(cmd: str, depth: int = 0) -> List[Tuple[List[str], List[str]]]:
+    """Split a shell command line into simple commands: (argv, redirect targets).
+
+    Quote-aware, so '>' or '|' inside quotes is data, not an operator. `bash -c "..."` is
+    parsed recursively so wrapping a command in a shell does not hide it.
+    """
+    try:
+        toks = _tokens(cmd or "")
+    except ValueError:  # unbalanced quotes: fall back to a crude split
+        toks = (cmd or "").split()
+    out: List[Tuple[List[str], List[str]]] = []
+    argv_: List[str] = []
+    redirs: List[str] = []
+    i = 0
+    while i <= len(toks):
+        t = toks[i] if i < len(toks) else ";"
+        if t in CONTROL_OPS or re.fullmatch(r"[;&|()\n]+", t):
+            if argv_ or redirs:
+                a = _strip_wrappers(argv_)
+                out.append((a, redirs))
+                if depth < 2 and a and os.path.basename(a[0]) in SHELLS and "-c" in a:
+                    k = a.index("-c")
+                    if k + 1 < len(a):
+                        out.extend(parse_commands(a[k + 1], depth + 1))
+            argv_, redirs = [], []
+        elif t in REDIRECT_OPS or re.fullmatch(r"[<>&]+", t):
+            if argv_ and argv_[-1].isdigit():
+                argv_.pop()  # an fd number like the 2 in 2>file
+            target = toks[i + 1] if i + 1 < len(toks) else ""
+            if ">" in t and target and target not in ("/dev/null", "&1", "&2") and not target.startswith("&"):
+                redirs.append(target)
+            i += 1  # skip the target (also for < input redirection)
+        else:
+            argv_.append(t)
+        i += 1
+    return out
+
+
+def argv(segment: str) -> List[str]:
+    cmds = parse_commands(segment)
+    return cmds[0][0] if cmds else []
 
 
 def _prog(toks: List[str]) -> str:
@@ -242,13 +281,19 @@ def new_dependency(toks: List[str]) -> List[str]:
     return []
 
 
+GIT_OPTS_WITH_VALUE = {"-c", "-C", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"}
+
+
 def _git_findings(toks: List[str], ctx: Context) -> List[Finding]:
     out: List[Finding] = []
     low = [t.lower() for t in toks]
-    if len(low) < 2:
+    k = 1
+    while k < len(low) and low[k].startswith("-"):  # global options before the subcommand
+        k += 2 if (low[k] in GIT_OPTS_WITH_VALUE and "=" not in low[k]) else 1
+    if k >= len(low):
         return out
-    sub = low[1]
-    rest = low[2:]
+    sub = low[k]
+    rest = low[k + 1:]
     prot = ctx.protected_branches
     if sub == "push":
         if any(t in ("-f", "--force", "--force-if-includes") or t.startswith("+") for t in rest):
@@ -261,7 +306,8 @@ def _git_findings(toks: List[str], ctx: Context) -> List[Finding]:
         out.append(Finding("dangerous", "git reset --hard discards work irreversibly. Use a new commit or ask the user."))
     elif sub == "clean" and any(t.startswith("-") and "f" in t for t in rest):
         out.append(Finding("dangerous", "git clean -f deletes untracked files irreversibly."))
-    elif sub in ("checkout", "restore") and rest and rest[-1] in (".", "--", ":/"):
+    elif sub in ("checkout", "restore") and rest and rest[-1] in (".", "--", ":/") and not (
+            sub == "restore" and "--staged" in rest and "--worktree" not in rest and "-w" not in rest):
         out.append(Finding("dangerous", "Discarding all working-tree changes is irreversible."))
     elif sub == "stash" and rest[:1] in (["drop"], ["clear"]):
         out.append(Finding("dangerous", "Dropping stashes loses work."))
@@ -283,14 +329,13 @@ def bash_findings(cmd: str, ctx: Context) -> List[Finding]:
     out: List[Finding] = []
     if USER_ONLY_CLI.search(cmd or ""):
         out.append(Finding("ledger_protection", "That cock-cage command is reserved for the user's own terminal."))
-    for seg in segments(cmd):
-        toks = argv(seg)
+    for toks, redirs in parse_commands(cmd):
         prog = _prog(toks)
-        raw = seg
+        raw = " ".join(toks)
         # dangerous commands
         if prog == "rm" and _dangerous_rm(toks):
             out.append(Finding("dangerous", "Recursive force-delete of a root, home or whole-project path."))
-        if prog in ("sudo", "doas") or re.search(r"(^|\s)sudo\s", raw):
+        if prog in ("sudo", "doas"):
             out.append(Finding("dangerous", "sudo is never needed for project work."))
         if prog in ("mkfs", "diskutil", "fdisk") or (prog == "dd" and re.search(r"of=/dev/", raw)):
             out.append(Finding("dangerous", "Disk-level commands are blocked."))
@@ -301,7 +346,7 @@ def bash_findings(cmd: str, ctx: Context) -> List[Finding]:
         if prog == "git":
             out.extend(_git_findings(toks, ctx))
         # secrets
-        for t in toks[1:] + redirect_targets(raw):
+        for t in toks[1:] + redirs:
             if is_secret_path(t):
                 out.append(Finding("secrets", "'%s' looks like a secrets file. Ask the user to handle it." % t))
                 break
@@ -314,8 +359,8 @@ def bash_findings(cmd: str, ctx: Context) -> List[Finding]:
                 "ask",
             ))
         # the cage itself
-        targets = toks[1:] + redirect_targets(raw)
-        writes = bool(redirect_targets(raw)) or prog in WRITE_PROGRAMS or prog in ("sed", "perl") and "-i" in " ".join(toks)
+        targets = toks[1:] + redirs
+        writes = bool(redirs) or prog in WRITE_PROGRAMS or prog in ("sed", "perl") and "-i" in " ".join(toks)
         for t in targets:
             if t.startswith("-"):
                 continue
@@ -341,10 +386,9 @@ def bash_findings(cmd: str, ctx: Context) -> List[Finding]:
 def bash_writes_project_files(cmd: str, ctx: Context) -> List[str]:
     """Heuristic: files a shell command would create or modify inside the project."""
     hits: List[str] = []
-    for seg in segments(cmd):
-        toks = argv(seg)
+    for toks, redirs in parse_commands(cmd):
         prog = _prog(toks)
-        cands: List[str] = list(redirect_targets(seg))
+        cands: List[str] = list(redirs)
         if prog in ("tee", "touch", "truncate"):
             cands += [t for t in toks[1:] if not t.startswith("-")]
         elif prog in ("cp", "mv", "install", "ln", "rsync") and len(toks) > 2:

@@ -31,6 +31,23 @@ def paths(root: str) -> Tuple[str, str]:
     return util.cc_path(root, "reports.md"), util.cc_path(root, "ledger.seal")
 
 
+def _record_path(root: str) -> str:
+    """A copy of the latest seal kept outside the project, so deleting the whole ledger is noticed."""
+    key = util.sha256_bytes(os.path.realpath(root).encode())[:16]
+    return os.path.join(util.user_dir(), "ledgers", key + ".json")
+
+
+def _write_record(root: str, n: int, sha: str) -> None:
+    try:
+        util.write_json(_record_path(root), {"project": os.path.realpath(root), "n": n, "sha": sha, "at": util.now_iso()})
+    except OSError:
+        pass
+
+
+def _escape(text: str) -> str:
+    return text.replace("<!-- cc:entry", "<!-- cc-entry")
+
+
 def _read_bytes(p: str) -> bytes:
     try:
         with open(p, "rb") as fh:
@@ -68,7 +85,10 @@ def entry_count(root: str) -> int:
 def verify(root: str) -> Tuple[bool, List[str]]:
     rp, sp = paths(root)
     data = _read_bytes(rp)
+    record = util.read_json(_record_path(root), None)
     if not data and not util.read_text(sp).strip():
+        if record and int(record.get("n", 0)) > 0:
+            return False, ["the ledger and its seal are gone; %s report(s) were recorded" % record["n"]]
         return True, []  # nothing logged yet
     problems: List[str] = []
     markers = list(MARKER_RE.finditer(data))
@@ -91,6 +111,8 @@ def verify(root: str) -> Tuple[bool, List[str]]:
                 problems.append("seal expects %s entries, file has %d" % (m.group(1), len(markers)))
             if m.group(2) != util.sha256_bytes(data):
                 problems.append("file hash differs from the seal (entries edited or removed)")
+    if record and (int(record.get("n", 0)) != len(markers) or record.get("sha") != util.sha256_bytes(data)) and not problems:
+        problems.append("the ledger no longer matches the copy of its seal kept outside the project")
     return (not problems), problems
 
 
@@ -111,12 +133,13 @@ def append(root: str, title: str, body: str, os_lock: bool = True) -> int:
     data = _read_bytes(rp)
     marker = "<!-- cc:entry n=%d prev=%s -->\n" % (n, util.sha256_bytes(data))
     stamp = util.now_iso()[:16].replace("T", " ")
-    text = marker + "## #%d · %s · %s\n\n%s\n" % (n, stamp, title.strip(), body.strip())
+    text = marker + "## #%d · %s · %s\n\n%s\n" % (n, stamp, _escape(title.strip()), _escape(body.strip()))
     with open(rp, "ab") as fh:
         fh.write(text.encode("utf-8"))
     full = _read_bytes(rp)
     with open(sp, "a", encoding="utf-8") as fh:
         fh.write("n=%d sha=%s at=%s\n" % (n, util.sha256_bytes(full), util.now_iso()))
+    _write_record(root, n, util.sha256_bytes(full))
     if os_lock:
         lock(root)
     return n
@@ -130,6 +153,8 @@ def reseal(root: str, os_lock: bool = True) -> int:
     unlock(root)
     data = _read_bytes(rp)
     if not data:
+        util.write_text(sp, "")
+        _write_record(root, 0, util.sha256_bytes(b""))
         return 0
     markers = list(MARKER_RE.finditer(data))
     head = data[: markers[0].start()] if markers else data
@@ -148,9 +173,32 @@ def reseal(root: str, os_lock: bool = True) -> int:
         fh.write(out)
     with open(sp, "w", encoding="utf-8") as fh:
         fh.write("n=%d sha=%s at=%s resealed-by-user\n" % (len(bodies), util.sha256_bytes(out), util.now_iso()))
+    _write_record(root, len(bodies), util.sha256_bytes(out))
     if os_lock:
         lock(root)
     return len(bodies)
+
+
+def delete_entries(root: str, numbers: List[int], os_lock: bool = True) -> int:
+    """Remove entries by number, then renumber and reseal. Only reachable through an approved request."""
+    rp, _ = paths(root)
+    unlock(root)
+    data = _read_bytes(rp)
+    markers = list(MARKER_RE.finditer(data))
+    drop = set(int(n) for n in numbers)
+    missing = drop - {int(m.group(1)) for m in markers}
+    if missing:
+        if os_lock:
+            lock(root)
+        raise ValueError("no such report(s): %s" % ", ".join("#%d" % n for n in sorted(missing)))
+    out = data[: markers[0].start()] if markers else data
+    for i, m in enumerate(markers):
+        end = markers[i + 1].start() if i + 1 < len(markers) else len(data)
+        if int(m.group(1)) not in drop:
+            out += data[m.start():end]
+    with open(rp, "wb") as fh:
+        fh.write(out)
+    return reseal(root, os_lock)
 
 
 def last_entry(root: str) -> Optional[str]:

@@ -25,6 +25,8 @@ TASK_DEFAULT: Dict[str, Any] = {
     "started_at": "",
     "fmt": {},                # file -> was it already ruff-formatted before Claude touched it
     "tidy": [],               # autofix/format notes carried across blocked Stop attempts
+    "created": [],            # files Claude created in this task
+    "dirty_at_start": [],     # files with the user's uncommitted work when the task began
 }
 
 STATE_DEFAULT: Dict[str, Any] = {
@@ -80,3 +82,5 @@ def reset_task(data: Dict[str, Any]) -> None:
     data["task"]["start_untracked"] = []
     data["task"]["fmt"] = {}
     data["task"]["tidy"] = []
+    data["task"]["created"] = []
+    data["task"]["dirty_at_start"] = []

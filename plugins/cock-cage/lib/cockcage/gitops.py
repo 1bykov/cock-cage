@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -32,6 +33,54 @@ def untracked(root: str) -> List[str]:
     return sorted(l for l in out.splitlines() if l.strip()) if code == 0 else []
 
 
+def toplevel(root: str) -> str:
+    code, out, _ = git(root, "rev-parse", "--show-toplevel")
+    return out.strip() if code == 0 and out.strip() else root
+
+
+def porcelain(root: str) -> Dict[str, str]:
+    """{path relative to root: XY status}, NUL-separated so odd file names survive."""
+    code, out, _ = git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ".")
+    if code != 0:
+        return {}
+    top = toplevel(root)
+    res: Dict[str, str] = {}
+    parts = out.split("\0")
+    i = 0
+    while i < len(parts):
+        entry = parts[i]
+        if len(entry) > 3:
+            xy, path = entry[:2], entry[3:]
+            if xy[0] in "RC":  # renames carry the old path in the next field
+                i += 1
+            relp = util.rel(root, os.path.join(top, path))
+            res[relp] = xy
+        i += 1
+    return res
+
+
+def dirty_paths(root: str) -> List[str]:
+    return sorted(porcelain(root)) if is_repo(root) else []
+
+
+def committable(root: str, paths: Sequence[str]) -> List[str]:
+    """Keep paths git can stage: inside the repo, not ignored, and existing or tracked (deleted files count)."""
+    if not paths or not is_repo(root):
+        return []
+    keep = []
+    for p in paths:
+        if p.startswith("..") or os.path.isabs(p):
+            continue
+        exists = os.path.lexists(os.path.join(root, p))
+        tracked = git(root, "ls-files", "--error-unmatch", "--", p)[0] == 0
+        if not exists and not tracked:
+            continue  # created and deleted again within the task
+        if exists and not tracked and git(root, "check-ignore", "-q", "--", p)[0] == 0:
+            continue
+        keep.append(p)
+    return keep
+
+
 def has_identity(root: str) -> bool:
     return git(root, "config", "user.email")[0] == 0 and git(root, "config", "user.name")[0] == 0
 
@@ -51,10 +100,10 @@ def ensure_task_branch(root: str, title: str, cfg: Dict) -> Optional[str]:
     if not g.get("auto_branch", True) or not is_repo(root):
         return None
     cur = branch(root)
-    if not cur or cur not in g.get("protected_branches", ["main", "master"]):
-        return None
     if not head(root):  # unborn branch: nothing to branch from yet
         return None
+    if cur and cur not in g.get("protected_branches", ["main", "master"]):
+        return None  # already on a working branch
     name = g.get("branch_prefix", "cc/") + slugify(title)
     base, i = name, 2
     while git(root, "rev-parse", "--verify", "--quiet", "refs/heads/" + name)[0] == 0:
@@ -86,7 +135,8 @@ def checkpoint(root: str, paths: Sequence[str], title: str, body: str, protected
     """Commit exactly these paths (other staged work is left alone). Returns the short sha."""
     if not paths or not is_repo(root):
         return None
-    if branch(root) in protected:
+    cur = branch(root)
+    if not cur or cur in protected:  # never commit on main, and never onto a detached HEAD
         return None
     existing = [p for p in paths if p]
     code, _, err = git(root, "add", "-A", "--", *existing)
@@ -100,6 +150,30 @@ def checkpoint(root: str, paths: Sequence[str], title: str, body: str, protected
     if code != 0:
         return None
     return head(root)[:8]
+
+
+def merge_into_protected(root: str, task_branch: str, protected: Sequence[str]) -> Tuple[bool, str]:
+    """Merge a finished task branch into main (fast-forward when possible), delete it, stay on main.
+
+    Uncommitted changes in the working tree travel with the switch, as git normally does. On any
+    conflict the merge is aborted and the task branch is left checked out, untouched.
+    """
+    target = next((b for b in protected if git(root, "rev-parse", "--verify", "--quiet", "refs/heads/" + b)[0] == 0), None)
+    if not target:
+        return False, "no main or master branch to merge into"
+    code, _, err = git(root, "switch", "--quiet", target)
+    if code != 0:
+        return False, "could not switch to %s: %s" % (target, err.strip()[:200])
+    code, _, _ = git(root, "merge", "--ff-only", "--quiet", task_branch)
+    if code != 0:
+        code, _, err = util.run(["git"] + _id_args(root) + ["merge", "--no-ff", "--quiet", "-m",
+                                "Merge %s" % task_branch, task_branch], cwd=root, timeout=60)
+        if code != 0:
+            git(root, "merge", "--abort")
+            git(root, "switch", "--quiet", task_branch)
+            return False, "merge into %s conflicted; %s kept for review" % (target, task_branch)
+    git(root, "branch", "-d", task_branch)
+    return True, target
 
 
 def diff_stat(root: str, start: str, paths: Sequence[str]) -> List[str]:

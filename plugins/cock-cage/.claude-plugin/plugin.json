@@ -1,6 +1,6 @@
 {
   "name": "cock-cage",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Guardrails for Claude Code in Python projects: plan before building, checks against a baseline, short educational reports in a hash-chained ledger, codebase map, duplicate detection, checkpoint commits and a growing skills library.",
   "author": {
     "name": "Igor Bykov",
@@ -9,5 +9,12 @@
   "homepage": "https://github.com/1bykov/cock-cage",
   "repository": "https://github.com/1bykov/cock-cage",
   "license": "MIT",
-  "keywords": ["python", "guardrails", "hooks", "testing", "reporting", "versioning"]
+  "keywords": [
+    "python",
+    "guardrails",
+    "hooks",
+    "testing",
+    "reporting",
+    "versioning"
+  ]
 }
